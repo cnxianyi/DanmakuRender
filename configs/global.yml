@@ -76,9 +76,9 @@ download_args:
       # 默认分辨率，此选项用于在程序无法获取流分辨率时指定默认分辨率用于弹幕录制
       default_resolution: [1920, 1080]
       # 开播检测间隔，每隔这段时间检测一次是否开播
-      start_check_interval: 60
+      start_check_interval: 10
       # 下播检测间隔，在主播下播但是未超过延迟下播时间时使用
-      stop_check_interval: 60
+      stop_check_interval: 10
       # 重启间隔时间，可设置为 [起始间隔，步长，最大间隔]
       # 设置为数字将会是定值
       restart_interval: [0, 10, 60]
@@ -93,6 +93,9 @@ download_args:
       min_video_duration: ~
       # 录制组编号，可用于多任务协同，详情请参考文档
       group_id: ~
+      # 按自然时钟切分视频（仅ffmpeg/streamlink引擎生效）
+      # 例如segment=3600时，将在整点切分：03:50 -> 04:00 -> 05:00
+      segment_atclocktime: False
       # 使用B站强制原画功能，仅适用于pyrequests引擎下的hls流
       bili_force_origin: True
       # ffmpeg取流参数(仅ffmpeg下载引擎生效)
@@ -124,15 +127,15 @@ download_args:
     # 指定弹幕占屏幕的最大比例（即屏幕上半部分有多少可以用来显示弹幕），默认为0.4
     dmrate: 0.4
     # 指定弹幕字体，默认为微软雅黑字体(Microsoft YaHei)
-    font: Microsoft YaHei
+    font: Segoe UI Emoji
     # 指定弹幕字体大小，默认为36
-    fontsize: 36
+    fontsize: 32
     # Distance from Screen Top 弹幕距离屏幕顶端的距离（像素，例如20，表示距离屏幕顶端20px）
     dst: 20
     # 指定单条弹幕持续时间（秒），默认为16
     dmduration: 16
     # 指定弹幕不透明度，默认为0.8
-    opacity: 0.8
+    opacity: 0.6
     # 使用自适应弹幕大小（会让把设置的弹幕大小按1080P标准缩放）
     auto_fontsize: True
     # 弹幕描边颜色(6位十六进制)
@@ -154,7 +157,7 @@ download_args:
       dm_type: ~
       # 关键字过滤，只要有关键字的弹幕都会被过滤
       # 例如：[菜, fw]
-      keywords: ~
+      keywords: ["军事"]
       # 用户名称过滤，只有用户名称完全与发弹幕的用户名相同才会过滤
       # 例如：[虎牙小助手, TwitchBot]
       username: ~
@@ -292,11 +295,11 @@ render_args:
     output_name: ~
     # 生成的视频文件格式，默认mp4
     format: mp4
-    # 硬件解码参数，默认由FFmpeg自动判断，如果出现问题可以设为空
-    hwaccel_args: [-hwaccel, auto]
-    # 视频编码器，NVIDIA设置为h264_nvenc，AMD设置为h264_amf，Apple用户设置为h264_videotoolbox，CPU设置为libx264
-    vencoder: h264_nvenc
-    # 视频编码器参数，默认恒定码率15Mbps
+    # 硬件解码参数：针对 Linux 下的 AMD 核显，指定 vaapi 硬件加速
+    hwaccel_args: [-hwaccel,auto]
+    # 编码器：Linux 系统下 AMD 显卡使用 h264_vaapi
+    vencoder: h264_amf
+    # 编码参数：设置码率为 15M，并指定 VAAPI 必要的像素格式转换滤镜
     vencoder_args: [-b:v, 15M]
     # 音频编码器
     aencoder: aac
@@ -320,9 +323,9 @@ render_args:
     # 生成的视频文件格式，默认mp4
     format: mp4
     # 硬件解码参数，默认由FFmpeg自动判断，如果出现问题可以设为空
-    hwaccel_args: [-hwaccel, auto]
+    hwaccel_args: []
     # 视频编码器，NVIDIA设置为h264_nvenc，AMD设置为h264_amf，Apple用户设置为h264_videotoolbox，CPU设置为libx264
-    vencoder: h264_nvenc
+    vencoder: h264_amf # h264_videotoolbox libx264
     # 视频编码器参数，默认恒定码率15Mbps
     vencoder_args: [-b:v, 15M]
     # 音频编码器
@@ -331,7 +334,7 @@ render_args:
     aencoder_args: [-b:a, 320K]
     # 输出重缩放，会把输出重缩放到指定分辨率，可以设置为'WxH'直接指定输出分辨率，例如'3840x2160'（4K）
     # 也可以指定为当前视频的大小倍数，例如'1.5'，这样1080P视频将会被放大到2880x1620（这个也符合了B站的4K视频标准）
-    output_resize: 1.5
+    output_resize: ~
     # 高级渲染参数
     # 请确保你明白这些参数的含义后再修改
     advanced_render_args: ~
@@ -357,7 +360,7 @@ upload_args:
     # 上传账号名称，程序依靠这个来识别不同的账号，如果打算传不同账号就要设置不同的名称
     account: bilibili
     # 上传cookies路径，如果设置为空将会保存到./login_info/{ACCOUNT}.json
-    cookies: ~
+    cookies: C:\Users\thefa\Videos\DanmakuRender\tools\cookies.json 
     # 重试次数，如果上传遇到错误将会重试，设置为0表示不重试
     # 注意：重试会整个视频重传，并且阻塞后面视频的上传，不应该设置太大
     # 同步上传无法重传
@@ -368,7 +371,7 @@ upload_args:
     # 实时上传（边录边传），每录制一个分段上传一次，同一场直播的不同分P仍然会在一个视频下，默认开启
     realtime: True
     # 上传的视频最短长度，小于此长度的视频会被自动过滤，默认120s
-    min_length: 120
+    min_length: 10
     # 以下参数来自biliuprs，详细内容可以参考 https://biliup.github.io/biliup-rs/index.html
     # 上传线路，设置为空则由程序自动选择
     line: ~
@@ -398,7 +401,7 @@ upload_args:
     # 动态内容，可以使用关键字替换
     dynamic: '{STREAMER.NAME} 的直播回放，{CTIME.YEAR}年{CTIME.MONTH:02d}月{CTIME.DAY:02d}日'
     # 标签（一定要有！多个标签逗号分割）
-    tag: '直播回放'
+    tag: '直播回放,三角洲行动,kami,oyo,游戏'
     # 延迟发布，单位秒，如果需要的话至少设置14400秒（4个小时）
     dtime: 0
     # 允许转载? 0-允许转载，1-禁止转载
@@ -533,7 +536,7 @@ clean_args:
     w_srcpre: True
   # 删除文件
   delete:
-    delay: 172800
+    delay: 86400
     w_srcfile: False
     w_srcpre: True
   # 自定义命令

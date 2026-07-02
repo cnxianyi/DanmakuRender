@@ -60,8 +60,10 @@ class StreamlinkDownloader():
         ]
         if self.segment:
             ffmpeg_args += ['-f','segment',
-                            '-segment_time',str(self.segment),
-                            '-reset_timestamps','1',
+                            '-segment_time',str(self.segment)]
+            if self.advanced_video_args.get('segment_atclocktime'):
+                ffmpeg_args += ['-segment_atclocktime','1']
+            ffmpeg_args += ['-reset_timestamps','1',
                             raw_name]
         else:
             ffmpeg_args += [raw_name]
