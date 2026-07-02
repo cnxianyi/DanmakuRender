@@ -300,7 +300,7 @@ render_args:
     # 编码器：Linux 系统下 AMD 显卡使用 h264_vaapi
     vencoder: h264_amf
     # 编码参数：设置码率为 15M，并指定 VAAPI 必要的像素格式转换滤镜
-    vencoder_args: [-b:v, 15M]
+    vencoder_args: [-global_quality, 20]
     # 音频编码器
     aencoder: aac
     # 音频编码器参数，默认恒定码率320Kbps
@@ -327,7 +327,8 @@ render_args:
     # 视频编码器，NVIDIA设置为h264_nvenc，AMD设置为h264_amf，Apple用户设置为h264_videotoolbox，CPU设置为libx264
     vencoder: h264_amf # h264_videotoolbox libx264
     # 视频编码器参数，默认恒定码率15Mbps
-    vencoder_args: [-b:v, 15M]
+    #vencoder_args: [-b:v, 15M]
+    vencoder_args: [-global_quality, 20]
     # 音频编码器
     aencoder: aac
     # 音频编码器参数，默认恒定码率320Kbps
