@@ -9,6 +9,15 @@ common_event_args:
   auto_clean: False
   # 原视频自动转码
   auto_transcode: False
+  # 使用 AI 识别视频中的主要游戏，并在最终 B 站标题添加游戏名前缀
+  ai_rename: False
+
+# AI 识别的任务级覆盖配置（可选）
+ai_rename_args:
+  # 开启后直接使用固定游戏名，不截图、不请求 AI
+  fixed_game: false
+  game: '三角洲行动'
+  rename_files: false
 
 # 下载参数
 download_args:

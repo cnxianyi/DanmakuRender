@@ -146,6 +146,8 @@ common_event_args:
   auto_clean: False
   # 原视频自动转码（可以用于给原视频做伪4K）
   auto_transcode: False
+  # 使用视觉AI识别视频中的主要游戏，并在最终 B 站标题添加游戏名前缀
+  ai_rename: False
 
 
 # 下载参数
@@ -165,6 +167,24 @@ render_args:
     ...
   transcode:
     ...
+
+# 单独的AI识别设置（可选）
+# 未设置的字段会继承全局 ai_rename_args
+ai_rename_args:
+  # 开启后直接使用固定游戏名，不截图、不请求 AI
+  fixed_game: false
+  game: '三角洲行动'
+  # rename_files 开启时默认只重命名弹幕版；不渲染弹幕版时应设置为 [src_video]
+  target_types: [dm_video]
+  # false 时不改本地文件名；只在上传完成后更新 B 站标题
+  rename_files: false
+  # 单个游戏名最多 10 个字符，BV 标题最多保留两个游戏
+  max_game_name_length: 10
+  bv_title_max_games: 2
+  # 整场直播上传完成后，把所有分段的游戏统计结果加到 BV 标题前
+  update_bv_title: false
+  bv_title_template: '【{GAMES}】{TITLE}'
+  bv_title_separator: '|'
   
 # 自动上传设置（可选）
 # 自动上传设置分为三个部分，对应程序生成的三种文件类型，想上传哪种视频就填哪个，不上传就删掉那一部分
@@ -187,6 +207,19 @@ clean:
   dm_video:
     ...
 ```
+
+**AI识别与 B 站标题说明**
+开启`ai_rename`后，每个录制分段完成时会从原视频的33%、66%、99%位置截图，并通过OpenAI Chat Completions兼容接口识别主要游戏。截图完成前会暂缓该分段进入上传和清理流程；识别或请求失败时保留原名并继续处理，不影响录制。默认`rename_files: false`，本地视频文件名保持不变；开启`rename_files: true`后，才会按`target_types`给本地文件名添加游戏前缀。
+```text
+oyo-2026年08月01日00点39分（弹幕版）.mp4
+-> 【三角洲行动】oyo-2026年08月01日00点39分（弹幕版）.mp4
+```
+上面的文件名示例仅在`rename_files: true`时生效；默认不会修改本地文件名。
+在`configs/global.yml`中填写`base_url`、支持图片输入的`model`和`api_key`。程序在写入调试日志时会把`api_key`显示为`***`。若接口不支持JSON响应格式，可设置`response_format: false`。
+
+开启`update_bv_title`后，程序会在整场直播的最后一个上传任务完成后，统计所有分段`games`数组中的非空游戏名，按出现次数降序生成标题。例如三角洲行动8次、幻兽帕鲁4次，则生成`【三角洲行动|幻兽帕鲁】{TITLE}`。该功能目前仅对 B 站上传生效；所有识别结果都为空时不修改标题。
+
+开启`fixed_game`后，程序不会为该任务截图或调用 AI，而是直接把`game`作为每个分段的游戏名。默认仅更新 BV 标题；本地文件名前缀只有在同时开启`rename_files`时才会执行。`fixed_game`只有在任务同时开启`common_event_args.ai_rename`时生效。
 
 **自动上传的配置格式说明**      
 每个视频类型都可以指定一个或者多个上传任务，组成一个数组。特别地，如果只上传一个地方，则可以直接指定参数，不必使用数组，示例如下：

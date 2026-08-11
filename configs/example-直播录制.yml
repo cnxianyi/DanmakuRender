@@ -9,6 +9,23 @@ common_event_args:
   auto_clean: True
   # 原视频自动转码
   auto_transcode: False
+  # 使用 AI 识别视频中的主要游戏，并在最终 B 站标题添加游戏名前缀
+  ai_rename: False
+
+# AI 识别的任务级覆盖配置（可选）
+ai_rename_args:
+  # 开启后直接使用固定游戏名，不截图、不请求 AI
+  fixed_game: false
+  game: '三角洲行动'
+  rename_files: false
+  # 单个游戏名最多 10 个字符
+  max_game_name_length: 10
+  # 整场直播的所有分段上传完成后，修改 B 站稿件标题
+  update_bv_title: false
+  bv_title_template: '【{GAMES}】{TITLE}'
+  bv_title_separator: '|'
+  bv_title_min_count: 1
+  bv_title_max_games: 2
 
 # 下载参数
 download_args:
