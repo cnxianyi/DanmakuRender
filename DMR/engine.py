@@ -11,6 +11,25 @@ from .WebService import WebService
 from .utils import *
 
 
+_SENSITIVE_KEYS = {
+    'api_key',
+    'authorization',
+    'access_token',
+    'refresh_token',
+}
+
+
+def _redact_sensitive_data(value):
+    if isinstance(value, dict):
+        return {
+            key: '***' if str(key).lower() in _SENSITIVE_KEYS and item else _redact_sensitive_data(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact_sensitive_data(item) for item in value]
+    return value
+
+
 class DMREngine():
     def __init__(self):
         self.logger = logging.getLogger(__name__)
@@ -21,7 +40,7 @@ class DMREngine():
         
     def pipeSend(self, message:PipeMessage):
         target = message.target
-        self.logger.debug(message)
+        self.logger.debug(_redact_sensitive_data(message))
         if target == 'engine':
             self.recv_queue.put(message)
         elif target.startswith('replay/'):
@@ -36,6 +55,8 @@ class DMREngine():
             self.plugin_dict['uploader']['send_queue'].put(message)
         elif target == 'cleaner':
             self.plugin_dict['cleaner']['send_queue'].put(message)
+        elif target == 'ai_rename':
+            self.plugin_dict['ai_rename']['send_queue'].put(message)
         elif target == 'downloader':
             self.plugin_dict['downloader']['send_queue'].put(message)
         else:
@@ -56,7 +77,7 @@ class DMREngine():
                 else:
                     self.pipeSend(message)
             except Exception as e:
-                self.logger.error(f'Message:{message} raise an error.')
+                self.logger.error(f'Message:{_redact_sensitive_data(message)} raise an error.')
                 self.logger.exception(e)
     
     def start(self):
@@ -87,6 +108,9 @@ class DMREngine():
             plugin = Uploader((self.recv_queue, send_queue), **config)
         elif name == 'cleaner':
             plugin = Cleaner((self.recv_queue, send_queue), **config)
+        elif name == 'ai_rename':
+            from .AIRename import AIRename
+            plugin = AIRename((self.recv_queue, send_queue), **config)
         elif name == 'downloader':
             plugin = Downloader((self.recv_queue, send_queue), **config)
         elif name == 'webservice':

@@ -11,6 +11,17 @@ from .Config import Config
 from .utils import filename_to_taskname
 
 
+def _redact_sensitive_config(value):
+    if isinstance(value, dict):
+        return {
+            key: '***' if key == 'api_key' and item else _redact_sensitive_config(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_sensitive_config(item) for item in value]
+    return value
+
+
 class DanmakuRender():
     def __init__(self, config:Config, **kwargs) -> None:
         self.logger = logging.getLogger('DMR')
@@ -24,19 +35,32 @@ class DanmakuRender():
         self.stoped = False
         os.makedirs('.temp', exist_ok=True)
         
-        self.logger.debug(f'Global Config:\n{json.dumps(self.config.global_config, indent=4, ensure_ascii=False)}')
-        self.logger.debug(f'Replay Config:\n{json.dumps(self.config.replay_config, indent=4, ensure_ascii=False)}')
+        global_config_log = _redact_sensitive_config(self.config.global_config)
+        replay_config_log = _redact_sensitive_config(self.config.replay_config)
+        self.logger.debug(f'Global Config:\n{json.dumps(global_config_log, indent=4, ensure_ascii=False)}')
+        self.logger.debug(f'Replay Config:\n{json.dumps(replay_config_log, indent=4, ensure_ascii=False)}')
         self.engine.start()
-        plugin_enabled = self.config.get_config('dmr_engine_args')['enabled_plugins']
+        plugin_enabled = list(self.config.get_config('dmr_engine_args')['enabled_plugins'])
         for plugin_name in plugin_enabled:
             plugin_config = self.config.get_config(plugin_name+'_kernel_args')
             self.engine.add_plugin(plugin_name, plugin_config)
 
         for taskname in self.config.get_replaytasks():
             replay_config = self.config.get_replay_config(taskname)
+            self._ensure_task_plugins(replay_config)
             self.engine.add_task(taskname, replay_config)
 
         threading.Thread(target=self._monintor, daemon=True).start()
+
+    def _ensure_task_plugins(self, replay_config):
+        ai_args = replay_config.get('ai_rename_args', {})
+        if replay_config['common_event_args'].get('ai_rename') and \
+                not ai_args.get('fixed_game') and \
+                'ai_rename' not in self.engine.plugin_dict:
+            self.engine.add_plugin(
+                'ai_rename',
+                self.config.get_config('ai_rename_kernel_args') or {},
+            )
 
     def check_config_update(self):
         try:
@@ -49,7 +73,9 @@ class DanmakuRender():
                 for config_path in update_info['new']:
                     taskname = filename_to_taskname(config_path)
                     self.logger.info(f'检测到新任务配置文件: {taskname}，正在添加任务...')
-                    self.engine.add_task(taskname, self.config.get_replay_config(taskname))
+                    replay_config = self.config.get_replay_config(taskname)
+                    self._ensure_task_plugins(replay_config)
+                    self.engine.add_task(taskname, replay_config)
                 
                 for config_path in update_info['deleted']:
                     taskname = filename_to_taskname(config_path)
@@ -63,7 +89,9 @@ class DanmakuRender():
                     self.engine.del_task(taskname)
                     time.sleep(5)
                     new_taskname = filename_to_taskname(config_path)
-                    self.engine.add_task(new_taskname, self.config.get_replay_config(new_taskname))
+                    replay_config = self.config.get_replay_config(new_taskname)
+                    self._ensure_task_plugins(replay_config)
+                    self.engine.add_task(new_taskname, replay_config)
 
         except Exception as e:
             self.logger.error(f'动态载入配置文件错误:')

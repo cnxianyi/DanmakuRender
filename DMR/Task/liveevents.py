@@ -1,13 +1,18 @@
 import logging
 import os
 from .baseevents import BaseEvents
+from ..AIRename.naming import rename_video
+from ..AIRename.parser import fixed_game_result
 from ..utils import *
 
 class LiveEvents(BaseEvents):
     def __init__(self, name, config):
         super().__init__(name, config)
         self.state_dict = {}
+        self.ai_rename_dict = {}
         self.ended_dict = {}
+        self.upload_request_dict = {}
+        self.bv_title_dict = {}
         self.logger = logging.getLogger(__name__)
 
     @property
@@ -21,8 +26,12 @@ class LiveEvents(BaseEvents):
             'downloader/livestop': self.onLiveEnd,
             'render/end': self.onRenderEnd,
             'render/error': self.defaultEvent,
+            'ai_rename/end': self.onAIRenameEnd,
+            'ai_rename/error': self.onAIRenameError,
             'uploader/end': self.onUploadEnd,
             'uploader/error': self.defaultEvent,
+            'uploader/title/end': self.defaultEvent,
+            'uploader/title/error': self.defaultEvent,
             'cleaner/end': self.defaultEvent,
             'cleaner/error': self.defaultEvent,
             'default': self.defaultEvent,
@@ -58,6 +67,38 @@ class LiveEvents(BaseEvents):
             self.state_dict[video.group_id] = [video_state]
 
         ret_msgs = []
+        ai_state = {
+            'status': 'disabled',
+            'request_id': None,
+            'games': [],
+            'main_game': '',
+            'renamed_types': set(),
+        }
+        if self.config['common_event_args'].get('ai_rename'):
+            ai_args = self.config.get('ai_rename_args', {})
+            fixed_result = fixed_game_result(ai_args)
+            if fixed_result is not None:
+                ai_state.update({'status': 'ready', **fixed_result})
+                if ai_state['main_game']:
+                    self.logger.info(f'{self.name}: 使用固定游戏名: {ai_state["main_game"]}.')
+                else:
+                    self.logger.warning(f'{self.name}: fixed_game 已开启，但 game 为空或被过滤.')
+            else:
+                ai_request_id = uuid()
+                ai_state.update({'status': 'recognizing', 'request_id': ai_request_id})
+                ret_msgs.append(PipeMessage(
+                    source=self.name,
+                    target='ai_rename',
+                    event='newtask',
+                    request_id=ai_request_id,
+                    data={
+                        'taskname': self.name,
+                        'video': video,
+                        'args': ai_args,
+                    },
+                ))
+        self.ai_rename_dict.setdefault(video.group_id, []).append(ai_state)
+
         if self.config['common_event_args'].get('auto_transcode'):
             transcode_args = self.config['render_args']['transcode']
             if transcode_args.get('output_name'):
@@ -121,6 +162,9 @@ class LiveEvents(BaseEvents):
             self.state_dict[video.group_id][-1]['dm_video']['wait'].append(render_msg.request_id)
             ret_msgs.append(render_msg)
 
+        if ai_state['status'] == 'ready':
+            self._apply_ai_rename(video.group_id, len(self.state_dict[video.group_id])-1)
+
         if self.config['common_event_args'].get('auto_upload'):
             ret_msgs += self._check_for_upload(video.group_id, len(self.state_dict[video.group_id])-1)
                 
@@ -142,6 +186,8 @@ class LiveEvents(BaseEvents):
             upload_msgs = self._check_for_upload(group_id)
             ret_msgs += upload_msgs
 
+        ret_msgs += self._check_for_bv_title(group_id)
+
         self._free_state_memory()
         
         return ret_msgs
@@ -157,6 +203,8 @@ class LiveEvents(BaseEvents):
                 continue
             for vtype, info in video_state.items():
                 if info['status'] != 'ready':
+                    continue
+                if not self._ai_rename_allows_upload(group_id, idx, vtype):
                     continue
                 for upload_file_types, upload_arg in upload_args.items():
                     # 判断当前视频是否需要上传
@@ -185,6 +233,7 @@ class LiveEvents(BaseEvents):
                             )
                             self.state_dict[group_id][idx][vtype]['status'] = 'uploading'
                             self.state_dict[group_id][idx][vtype]['wait'].append(upload_msg.request_id)
+                            self._remember_upload_request(upload_msg, group_id)
                             ret_msgs.append(upload_msg)
         
         # 如果当前视频组已经被标记结束，检查是否有视频组完全准备好上传（用于非实时上传）
@@ -195,7 +244,8 @@ class LiveEvents(BaseEvents):
                 # 检查是否全部准备上传
                 videos = []
                 for idx, video_state in enumerate(self.state_dict[group_id]):
-                    if video_state[vtype]['status'] == 'ready':
+                    if video_state[vtype]['status'] == 'ready' and \
+                            self._ai_rename_allows_upload(group_id, idx, vtype):
                         videos.append(video_state[vtype]['file'])
                     else:
                         videos = []
@@ -230,6 +280,7 @@ class LiveEvents(BaseEvents):
                             for idx, _ in enumerate(self.state_dict[group_id]):
                                 self.state_dict[group_id][idx][vtype]['status'] = 'uploading'
                                 self.state_dict[group_id][idx][vtype]['wait'].append(upload_msg.request_id)
+                            self._remember_upload_request(upload_msg, group_id)
                             ret_msgs.append(upload_msg)
 
         return ret_msgs
@@ -247,12 +298,205 @@ class LiveEvents(BaseEvents):
                     if len(self.state_dict[video.group_id][idx][vtype]['wait']) == 0:
                         self.state_dict[video.group_id][idx][vtype]['status'] = 'ready'
                         self.state_dict[video.group_id][idx][vtype]['file'] = video
+
+        self._apply_ai_rename(video.group_id)
         
         ret_msgs = []
         if self.config['common_event_args'].get('auto_upload'):
             upload_msgs = self._check_for_upload(video.group_id)
             ret_msgs += upload_msgs
 
+        return ret_msgs
+
+    def _remember_upload_request(self, upload_msg, group_id):
+        data = upload_msg.data
+        args = data.get('args') or {}
+        files = data.get('files') or []
+        title = args.get('title', '')
+        if title and files:
+            try:
+                title = replace_keywords(title, files[0])
+            except Exception as e:
+                self.logger.warning(f'解析上传标题失败: {e}')
+                title = ''
+        self.upload_request_dict[upload_msg.request_id] = {
+            'group_id': group_id,
+            'upload_group': data.get('upload_group'),
+            'engine': data.get('engine'),
+            'title': title,
+            'args': {
+                'account': args.get('account'),
+                'cookies': args.get('cookies'),
+                'limit': args.get('limit', 3),
+            },
+        }
+
+    def _group_work_complete(self, group_id):
+        if group_id not in self.ended_dict:
+            return False
+        if any(state['status'] == 'recognizing' for state in self.ai_rename_dict.get(group_id, [])):
+            return False
+        for video_state in self.state_dict.get(group_id, []):
+            for info in video_state.values():
+                if info['wait'] or info['status'] in ('rendering', 'uploading'):
+                    return False
+        return True
+
+    def _check_for_bv_title(self, group_id):
+        config = self.config.get('ai_rename_args', {})
+        if not config.get('update_bv_title') or not self._group_work_complete(group_id):
+            return []
+
+        from ..AIRename.bvtitle import build_bv_title
+
+        state = self.bv_title_dict.get(group_id)
+        if not state:
+            return []
+
+        ret_msgs = []
+        for upload in state['uploads'].values():
+            bvid = upload.get('bvid')
+            if not bvid or bvid in state['queued']:
+                continue
+            if upload.get('engine') not in ('biliuprs', 'biliwebapi'):
+                continue
+            title, games = build_bv_title(
+                upload.get('title'),
+                self.ai_rename_dict.get(group_id, []),
+                config,
+            )
+            state['queued'].add(bvid)
+            if not title:
+                self.logger.info(f'视频组 {group_id} 没有可用的游戏识别结果，不修改 {bvid} 标题.')
+                continue
+            self.logger.info(f'视频组 {group_id} 游戏统计结果: {games}; 准备修改 {bvid} 标题.')
+            ret_msgs.append(PipeMessage(
+                source=self.name,
+                target='uploader',
+                event='edit_bv_title',
+                request_id=uuid(),
+                data={
+                    'bvid': bvid,
+                    'title': title,
+                    'args': upload.get('args') or {},
+                    'delay': config.get('bv_title_delay', 10),
+                    'retries': config.get('bv_title_retries', 2),
+                    'retry_interval': config.get('bv_title_retry_interval', 30),
+                },
+            ))
+        return ret_msgs
+
+    def _ai_target_types(self):
+        target_types = self.config.get('ai_rename_args', {}).get('target_types', ['dm_video'])
+        if not target_types:
+            return set()
+        if isinstance(target_types, str):
+            target_types = target_types.replace(',', '+').split('+')
+        return {str(vtype).strip() for vtype in target_types if str(vtype).strip()}
+
+    def _find_ai_state(self, request_id):
+        for group_id, states in self.ai_rename_dict.items():
+            for idx, state in enumerate(states):
+                if state['request_id'] == request_id:
+                    return group_id, idx, state
+        return None, None, None
+
+    def _rename_dependencies_ready(self, video_state, vtype):
+        if vtype not in ('src_video', 'src_video_pre'):
+            return True
+        return all(info['status'] != 'rendering' for info in video_state.values())
+
+    def _apply_ai_rename(self, group_id, _idx=None):
+        if not self.config['common_event_args'].get('ai_rename'):
+            return
+        if group_id not in self.state_dict or group_id not in self.ai_rename_dict:
+            return
+
+        target_types = self._ai_target_types()
+        config = self.config.get('ai_rename_args', {})
+        for idx, video_state in enumerate(self.state_dict[group_id]):
+            if _idx is not None and idx != _idx:
+                continue
+            ai_state = self.ai_rename_dict[group_id][idx]
+            if ai_state['status'] != 'ready' or not ai_state['main_game']:
+                continue
+            for vtype in target_types:
+                info = video_state.get(vtype)
+                if not info or info['status'] != 'ready' or not info['file']:
+                    continue
+                if vtype in ai_state['renamed_types']:
+                    continue
+                if not self._rename_dependencies_ready(video_state, vtype):
+                    continue
+                if not config.get('rename_files', False):
+                    # Keep local filenames unchanged; only the final BV title is updated.
+                    self.logger.info(
+                        f'视频 {info["file"].path} 保持原文件名，AI 结果仅用于最终 B 站标题.'
+                    )
+                    ai_state['renamed_types'].add(vtype)
+                    continue
+                old_path = info['file'].path
+                try:
+                    new_path = rename_video(info['file'], ai_state['main_game'], config)
+                    if new_path != old_path:
+                        self.logger.info(f'视频已根据 AI 识别结果重命名: {old_path} -> {new_path}')
+                except Exception as e:
+                    self.logger.warning(f'视频 {old_path} AI 重命名失败，将保留原文件名: {e}')
+                finally:
+                    # 重命名失败也必须放行上传，不能让后处理链永久等待。
+                    ai_state['renamed_types'].add(vtype)
+
+    def _ai_rename_allows_upload(self, group_id, idx, vtype):
+        if not self.config['common_event_args'].get('ai_rename'):
+            return True
+        try:
+            ai_state = self.ai_rename_dict[group_id][idx]
+        except (KeyError, IndexError):
+            return False
+        # AI 使用原视频截图；识别完成前不能让任一文件进入上传后清理阶段。
+        if ai_state['status'] == 'recognizing':
+            return False
+        if vtype not in self._ai_target_types():
+            return True
+        if ai_state['status'] in ('disabled', 'failed'):
+            return True
+        if ai_state['status'] != 'ready':
+            return False
+        if not ai_state['main_game']:
+            return True
+        return vtype in ai_state['renamed_types']
+
+    def onAIRenameEnd(self, message:PipeMessage):
+        self.logger.info(f'{self.name}: {message.msg}.')
+        group_id, idx, ai_state = self._find_ai_state(message.request_id)
+        if ai_state is None:
+            self.logger.debug(f'No AI rename state for request:{message.request_id}.')
+            return
+        data = message.data or {}
+        ai_state.update({
+            'status': 'ready',
+            'games': data.get('games', []),
+            'main_game': data.get('main_game', ''),
+        })
+        self._apply_ai_rename(group_id, idx)
+
+        ret_msgs = []
+        if self.config['common_event_args'].get('auto_upload'):
+            ret_msgs += self._check_for_upload(group_id, idx)
+        self._free_state_memory()
+        return ret_msgs
+
+    def onAIRenameError(self, message:PipeMessage):
+        self.logger.warning(f'{self.name}: {message.msg}.')
+        group_id, idx, ai_state = self._find_ai_state(message.request_id)
+        if ai_state is None:
+            return
+        ai_state['status'] = 'failed'
+
+        ret_msgs = []
+        if self.config['common_event_args'].get('auto_upload'):
+            ret_msgs += self._check_for_upload(group_id, idx)
+        self._free_state_memory()
         return ret_msgs
     
     def _check_for_clean(self, group_id=None):
@@ -310,40 +554,85 @@ class LiveEvents(BaseEvents):
                         need_free = False
                         break
                 if not need_free: break
+            if need_free and self.config['common_event_args'].get('ai_rename'):
+                if any(state['status'] == 'recognizing' for state in self.ai_rename_dict.get(group_id, [])):
+                    need_free = False
             if need_free:
                 self.logger.debug(f'视频组{group_id}处理完成，视频信息已被释放.')
                 self.ended_dict.pop(group_id)
                 self.state_dict.pop(group_id)
+                self.ai_rename_dict.pop(group_id, None)
+                self.bv_title_dict.pop(group_id, None)
+                self.upload_request_dict = {
+                    request_id: upload
+                    for request_id, upload in self.upload_request_dict.items()
+                    if upload['group_id'] != group_id
+                }
 
         for group_id in list(self.ended_dict.keys()):
             if time.time() - self.ended_dict[group_id] > 72*3600:
                 self.logger.debug(f'视频组{group_id}处理超时，视频信息将被释放.')
                 self.ended_dict.pop(group_id)
                 self.state_dict.pop(group_id)
+                self.ai_rename_dict.pop(group_id, None)
+                self.bv_title_dict.pop(group_id, None)
+                self.upload_request_dict = {
+                    request_id: upload
+                    for request_id, upload in self.upload_request_dict.items()
+                    if upload['group_id'] != group_id
+                }
 
     def onUploadEnd(self, message:PipeMessage):
         self.logger.info(f'{self.name}: {message.msg}.')
         request_id = message.request_id
+        upload = self.upload_request_dict.pop(request_id, None)
+        data = message.data or {}
+        if upload and data.get('bvid'):
+            group_id = upload['group_id']
+            upload.update({
+                'bvid': data.get('bvid'),
+                'engine': data.get('engine') or upload.get('engine'),
+                'upload_group': data.get('upload_group') or upload.get('upload_group'),
+            })
+            title_state = self.bv_title_dict.setdefault(group_id, {'uploads': {}, 'queued': set()})
+            existing_upload = title_state['uploads'].get(upload['upload_group'])
+            if existing_upload:
+                # A realtime BV is created by the first segment. Keep that segment's
+                # resolved base title even when later append requests complete.
+                existing_upload.update({
+                    'bvid': upload['bvid'],
+                    'engine': upload['engine'],
+                })
+            else:
+                title_state['uploads'][upload['upload_group']] = upload
         # 将状态信息中request_id对应的等待移除
+        matched_groups = set()
         for group_id, video_states in self.state_dict.items():
             for idx, video_state in enumerate(video_states):
                 for vtype, info in video_state.items():
                     if request_id in info['wait']:
+                        matched_groups.add(group_id)
                         self.state_dict[group_id][idx][vtype]['wait'].remove(request_id)
                         if len(self.state_dict[group_id][idx][vtype]['wait']) == 0:
                             self.state_dict[group_id][idx][vtype]['status'] = 'uploaded'
         
         ret_msgs = []
+        for group_id in matched_groups:
+            ret_msgs += self._check_for_bv_title(group_id)
         if self.config['common_event_args'].get('auto_clean'):
             clean_msgs = self._check_for_clean()
             ret_msgs += clean_msgs
-        
+
+        self._free_state_memory()
         return ret_msgs
 
     def onExit(self, *args, **kwargs) -> None:
         self.logger.info(f'{self.name}: 任务结束.')
         self.state_dict.clear()
+        self.ai_rename_dict.clear()
         self.ended_dict.clear()
+        self.upload_request_dict.clear()
+        self.bv_title_dict.clear()
         return PipeMessage(
             source=self.name,
             target='downloader',

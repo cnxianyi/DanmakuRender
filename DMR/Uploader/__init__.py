@@ -3,6 +3,7 @@ import threading
 import queue
 import time
 import json
+import re
 from concurrent.futures import ThreadPoolExecutor
 from os.path import join, exists
 from datetime import datetime
@@ -107,6 +108,8 @@ class Uploader():
                 if message.target == 'uploader':
                     if message.event == 'newtask':
                         self.add_task(message)
+                    elif message.event == 'edit_bv_title':
+                        self.upload_executors.submit(self._edit_bv_title, message)
             except Exception as e:
                 self.logger.error(f'Message:{message} raise an error.')
                 self.logger.exception(e)
@@ -150,7 +153,7 @@ class Uploader():
             else:
                 self.upload_executors.submit(self._upload_subprocess, task)
 
-    def _gather(self, task, status, desc=''):
+    def _gather(self, task, status, desc='', data=None):
         with self._lock:
             self.upload_tasks.pop(task['uuid'], None)
             if status == 'error':
@@ -178,10 +181,52 @@ class Uploader():
                     target=task['source'],
                     request_id=task['request_id'],
                     dtype='dict',
-                    data={
-                        # 'config': task['config'],
-                    },
+                    data=data or {},
                 )
+
+    def _edit_bv_title(self, message:PipeMessage):
+        config = message.data or {}
+        bvid = config.get('bvid')
+        title = config.get('title')
+        delay = max(0, float(config.get('delay', 10)))
+        retries = max(0, int(config.get('retries', 2)))
+        retry_interval = max(1, float(config.get('retry_interval', 30)))
+        try:
+            from DMR.AIRename.bvtitle import update_bilibili_title
+
+            if delay:
+                time.sleep(delay)
+            for attempt in range(retries + 1):
+                try:
+                    changed = update_bilibili_title(bvid, title, config.get('args') or {})
+                    break
+                except Exception:
+                    if attempt >= retries:
+                        raise
+                    self.logger.warning(
+                        f'B 站稿件 {bvid} 标题修改失败，'
+                        f'{retry_interval:g} 秒后重试 ({attempt + 1}/{retries}).'
+                    )
+                    time.sleep(retry_interval)
+            action = '已修改' if changed else '无需修改'
+            self._pipeSend(
+                event='title/end',
+                msg=f'B 站稿件 {bvid} 标题{action}: {title}',
+                target=message.source,
+                request_id=message.request_id,
+                dtype='dict',
+                data={'bvid': bvid, 'title': title, 'changed': changed},
+            )
+        except Exception as e:
+            self.logger.exception(e)
+            self._pipeSend(
+                event='title/error',
+                msg=f'B 站稿件 {bvid} 标题修改失败: {e}',
+                target=message.source,
+                request_id=message.request_id,
+                dtype=str(type(e)),
+                data={'bvid': bvid, 'title': title, 'error': str(e)},
+            )
 
     def _upload_subprocess(self, task):
         task['status'] = 'uploading'
@@ -254,7 +299,17 @@ class Uploader():
                     time.sleep(60)
             
             if status:
-                self._gather(task, 'info', desc=info)
+                bvid_match = re.search(r'BV[0-9A-Za-z]{10}', str(info or ''))
+                bvid = bvid_match.group(0) if bvid_match else None
+                if not bvid:
+                    bvid = getattr(getattr(target_uploader, 'videos', None), 'bvid', None)
+                if not bvid:
+                    bvid = (getattr(target_uploader, 'task_info', None) or {}).get('bvid')
+                self._gather(task, 'info', desc=info, data={
+                    'bvid': bvid,
+                    'engine': task['engine'],
+                    'upload_group': task['upload_group'],
+                })
             else:
                 self._gather(task, 'error', desc=info)
 

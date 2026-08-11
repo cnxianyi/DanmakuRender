@@ -79,6 +79,14 @@ class Config():
                 if _replay_config.get('render_args'):
                     replay_config['render_args'] = merge_dict(replay_config['render_args'], _replay_config['render_args'])
 
+            if common_args.get('ai_rename'):
+                replay_config['ai_rename_args'] = deepcopy(self.global_config.get('ai_rename_args', {}))
+                if _replay_config.get('ai_rename_args'):
+                    replay_config['ai_rename_args'] = merge_dict(
+                        replay_config['ai_rename_args'],
+                        _replay_config['ai_rename_args'],
+                    )
+
             if common_args.get('auto_upload'):
                 global_upload_args = self.global_config['upload_args']
                 replay_config['upload_args'] = {}
