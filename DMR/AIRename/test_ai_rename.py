@@ -1,4 +1,5 @@
 import os
+import json
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -8,10 +9,12 @@ import requests
 
 from DMR.AIRename.bvtitle import build_bv_title, rank_games
 from DMR.AIRename.client import OpenAICompatibleVisionClient
+from DMR import _redact_sensitive_config
 from DMR.engine import _redact_sensitive_data
 from DMR.AIRename.frames import extract_frames
 from DMR.AIRename.naming import rename_video
 from DMR.AIRename.parser import fixed_game_result, parse_game_result
+from DMR.AIRename.telegram import parse_update_reply, send_frame_album, telegram_config
 from DMR.Task.liveevents import LiveEvents
 from DMR.utils import PipeMessage, VideoInfo
 
@@ -87,12 +90,105 @@ class SensitiveLoggingTests(unittest.TestCase):
                 'api_key': 'secret',
                 'headers': {'Authorization': 'Bearer secret'},
                 'api_key_env': 'AI_API_KEY',
+                'tg': {'bot_token': 'telegram-secret'},
             },
         })
 
         self.assertEqual(result['args']['api_key'], '***')
         self.assertEqual(result['args']['headers']['Authorization'], '***')
         self.assertEqual(result['args']['api_key_env'], 'AI_API_KEY')
+        self.assertEqual(result['args']['tg']['bot_token'], '***')
+
+    def test_redacts_telegram_token_shorthand(self):
+        value = {'ai_rename_args': {'tg': '123456:ABCDEF'}}
+        self.assertEqual(
+            _redact_sensitive_data(value)['ai_rename_args']['tg'],
+            '***',
+        )
+        self.assertEqual(
+            _redact_sensitive_config(value)['ai_rename_args']['tg'],
+            '***',
+        )
+
+
+class TelegramAlbumTests(unittest.TestCase):
+    def test_accepts_token_only_shorthand(self):
+        self.assertEqual(
+            telegram_config({'tg': '123456:ABCDEF'}),
+            {'enabled': True, 'bot_token': '123456:ABCDEF'},
+        )
+
+    @patch('DMR.AIRename.telegram.requests.post')
+    def test_sends_all_frames_as_one_media_group(self, post):
+        post.return_value.ok = True
+        post.return_value.json.return_value = {
+            'ok': True,
+            'result': [
+                {
+                    'message_id': message_id,
+                    'media_group_id': 'album-1',
+                    'chat': {'id': -100123456},
+                }
+                for message_id in (101, 102, 103)
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            frame_paths = []
+            for index in range(3):
+                frame_path = os.path.join(directory, f'frame-{index}.jpg')
+                with open(frame_path, 'wb') as file:
+                    file.write(b'image')
+                frame_paths.append(frame_path)
+
+            sent = send_frame_album(frame_paths, {
+                'tg': {
+                    'enabled': True,
+                    'bot_token': 'telegram-token',
+                    'chat_id': '-100123456',
+                    'retries': 0,
+                },
+            }, caption='test caption')
+
+        self.assertEqual(sent, {
+            'chat_id': '-100123456',
+            'message_ids': [101, 102, 103],
+            'media_group_id': 'album-1',
+        })
+        self.assertEqual(post.call_count, 1)
+        url = post.call_args.args[0]
+        kwargs = post.call_args.kwargs
+        media = json.loads(kwargs['data']['media'])
+        self.assertTrue(url.endswith('/bottelegram-token/sendMediaGroup'))
+        self.assertEqual(kwargs['data']['chat_id'], '-100123456')
+        self.assertEqual(len(kwargs['files']), 3)
+        self.assertEqual(len(media), 3)
+        self.assertEqual(media[0]['caption'], 'test caption')
+        self.assertNotIn('caption', media[1])
+
+    def test_parses_update_only_when_replying_to_album_message(self):
+        command = parse_update_reply({
+            'update_id': 88,
+            'message': {
+                'message_id': 200,
+                'chat': {'id': 123456},
+                'text': '/update 瓦',
+                'reply_to_message': {'message_id': 101},
+            },
+        })
+
+        self.assertEqual(command, {
+            'update_id': 88,
+            'chat_id': '123456',
+            'reply_message_id': 101,
+            'message_id': 200,
+            'game': '瓦',
+        })
+        self.assertIsNone(parse_update_reply({
+            'message': {
+                'chat': {'id': 123456},
+                'text': '/update 瓦',
+            },
+        }))
 
 
 class BVTitleTests(unittest.TestCase):
@@ -247,6 +343,36 @@ class LiveEventsAIRenameTests(unittest.TestCase):
         self.assertEqual(events.ai_rename_dict['group'][0]['status'], 'ready')
         self.assertEqual(events.ai_rename_dict['group'][0]['games'], ['三角洲行动'] * 3)
 
+    def test_fixed_game_with_telegram_queues_screenshot_task(self):
+        config = self._config()
+        config['ai_rename_args'].update({
+            'fixed_game': True,
+            'game': '三角洲行动',
+            'tg': {'enabled': True, 'bot_token': 'token', 'chat_id': '123'},
+        })
+        events = LiveEvents('test', config)
+        video = VideoInfo(
+            path='input.flv',
+            group_id='group',
+            segment_id=1,
+            duration=60,
+        )
+
+        messages = events.onLiveSegment(PipeMessage(
+            source='downloader',
+            target='replay/test',
+            event='livesegment',
+            data=video,
+        ))
+
+        ai_messages = [message for message in messages if message.target == 'ai_rename']
+        self.assertEqual(len(ai_messages), 1)
+        self.assertEqual(
+            ai_messages[0].data['args']['_fixed_result']['main_game'],
+            '三角洲行动',
+        )
+        self.assertEqual(events.ai_rename_dict['group'][0]['status'], 'recognizing')
+
     def test_ai_callback_renames_ready_target(self):
         with tempfile.TemporaryDirectory() as directory:
             events = LiveEvents('test', self._config())
@@ -364,6 +490,25 @@ class LiveEventsAIRenameTests(unittest.TestCase):
         self.assertEqual(messages[0].event, 'edit_bv_title')
         self.assertTrue(messages[0].data['title'].startswith('【三角洲行动|幻兽帕鲁】'))
         self.assertEqual(events._check_for_bv_title('group'), [])
+
+        override = events.onTelegramUpdate(PipeMessage(
+            source='ai_rename',
+            target='replay/test',
+            event='telegram_update',
+            request_id='ai-request',
+            data={'group_id': 'group', 'game': '瓦'},
+        ))
+
+        self.assertEqual(len(override), 1)
+        self.assertTrue(override[0].data['title'].startswith('【瓦】'))
+        self.assertNotIn('三角洲行动', override[0].data['title'])
+        self.assertEqual(events.onTelegramUpdate(PipeMessage(
+            source='ai_rename',
+            target='replay/test',
+            event='telegram_update',
+            request_id='ai-request',
+            data={'group_id': 'group', 'game': '瓦'},
+        )), [])
 
 
 if __name__ == '__main__':

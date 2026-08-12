@@ -2,7 +2,7 @@ import logging
 import os
 from .baseevents import BaseEvents
 from ..AIRename.naming import rename_video
-from ..AIRename.parser import fixed_game_result
+from ..AIRename.parser import fixed_game_result, normalize_game
 from ..utils import *
 
 class LiveEvents(BaseEvents):
@@ -13,6 +13,7 @@ class LiveEvents(BaseEvents):
         self.ended_dict = {}
         self.upload_request_dict = {}
         self.bv_title_dict = {}
+        self.bv_manual_game_dict = {}
         self.logger = logging.getLogger(__name__)
 
     @property
@@ -28,6 +29,7 @@ class LiveEvents(BaseEvents):
             'render/error': self.defaultEvent,
             'ai_rename/end': self.onAIRenameEnd,
             'ai_rename/error': self.onAIRenameError,
+            'ai_rename/telegram_update': self.onTelegramUpdate,
             'uploader/end': self.onUploadEnd,
             'uploader/error': self.defaultEvent,
             'uploader/title/end': self.defaultEvent,
@@ -77,12 +79,32 @@ class LiveEvents(BaseEvents):
         if self.config['common_event_args'].get('ai_rename'):
             ai_args = self.config.get('ai_rename_args', {})
             fixed_result = fixed_game_result(ai_args)
+            tg_config = ai_args.get('tg')
+            tg_enabled = bool(tg_config) if isinstance(tg_config, str) \
+                else bool((tg_config or {}).get('enabled'))
             if fixed_result is not None:
                 ai_state.update({'status': 'ready', **fixed_result})
                 if ai_state['main_game']:
                     self.logger.info(f'{self.name}: 使用固定游戏名: {ai_state["main_game"]}.')
                 else:
                     self.logger.warning(f'{self.name}: fixed_game 已开启，但 game 为空或被过滤.')
+                if tg_enabled:
+                    ai_request_id = uuid()
+                    ai_state.update({'status': 'recognizing', 'request_id': ai_request_id})
+                    ret_msgs.append(PipeMessage(
+                        source=self.name,
+                        target='ai_rename',
+                        event='newtask',
+                        request_id=ai_request_id,
+                        data={
+                            'taskname': self.name,
+                            'video': video,
+                            'args': {
+                                **ai_args,
+                                '_fixed_result': fixed_result,
+                            },
+                        },
+                    ))
             else:
                 ai_request_id = uuid()
                 ai_state.update({'status': 'recognizing', 'request_id': ai_request_id})
@@ -356,20 +378,33 @@ class LiveEvents(BaseEvents):
         ret_msgs = []
         for upload in state['uploads'].values():
             bvid = upload.get('bvid')
-            if not bvid or bvid in state['queued']:
+            if not bvid:
                 continue
             if upload.get('engine') not in ('biliuprs', 'biliwebapi'):
                 continue
+            manual_game = self.bv_manual_game_dict.get(group_id)
+            title_states = self.ai_rename_dict.get(group_id, [])
+            if manual_game:
+                # A Telegram reply is authoritative for the whole BV, rather than
+                # one more vote in the per-segment recognition statistics.
+                title_states = [{'games': [manual_game], 'main_game': manual_game}]
             title, games = build_bv_title(
                 upload.get('title'),
-                self.ai_rename_dict.get(group_id, []),
+                title_states,
                 config,
             )
-            state['queued'].add(bvid)
             if not title:
                 self.logger.info(f'视频组 {group_id} 没有可用的游戏识别结果，不修改 {bvid} 标题.')
                 continue
-            self.logger.info(f'视频组 {group_id} 游戏统计结果: {games}; 准备修改 {bvid} 标题.')
+            queued = state.setdefault('queued', {})
+            if isinstance(queued, set):
+                # Compatibility with state created before manual overrides were added.
+                queued = state['queued'] = {}
+            if queued.get(bvid) == title:
+                continue
+            queued[bvid] = title
+            source = 'Telegram 人工结果' if manual_game else '游戏统计结果'
+            self.logger.info(f'视频组 {group_id} {source}: {games}; 准备修改 {bvid} 标题.')
             ret_msgs.append(PipeMessage(
                 source=self.name,
                 target='uploader',
@@ -498,6 +533,29 @@ class LiveEvents(BaseEvents):
             ret_msgs += self._check_for_upload(group_id, idx)
         self._free_state_memory()
         return ret_msgs
+
+    def onTelegramUpdate(self, message:PipeMessage):
+        data = message.data or {}
+        group_id, _idx, ai_state = self._find_ai_state(message.request_id)
+        if group_id is None:
+            group_id = data.get('group_id')
+        if group_id not in self.state_dict:
+            self.logger.info('Telegram /update 对应的视频状态已过期，已忽略.')
+            return
+
+        game = normalize_game(data.get('game', ''), self.config.get('ai_rename_args', {}))
+        if not game:
+            self.logger.warning('Telegram /update 的游戏名为空或被过滤，已忽略.')
+            return
+
+        self.bv_manual_game_dict[group_id] = game
+        if ai_state is not None:
+            ai_state['manual_game'] = game
+        self.logger.info(f'{self.name}: Telegram 人工覆盖视频组 {group_id} 的 BV 游戏前缀为【{game}】.')
+
+        # Before upload completion this stores the override for the normal final edit;
+        # after completion it queues another edit only when the target title changed.
+        return self._check_for_bv_title(group_id)
     
     def _check_for_clean(self, group_id=None):
         ret_msgs = []
@@ -557,12 +615,21 @@ class LiveEvents(BaseEvents):
             if need_free and self.config['common_event_args'].get('ai_rename'):
                 if any(state['status'] == 'recognizing' for state in self.ai_rename_dict.get(group_id, [])):
                     need_free = False
+            tg_config = self.config.get('ai_rename_args', {}).get('tg') or {}
+            if isinstance(tg_config, str):
+                tg_config = {'enabled': True}
+            reply_window = max(0, float(tg_config.get('reply_window', 86400)))
+            if need_free and config.get('update_bv_title') and tg_config.get('enabled') and reply_window and \
+                    time.time() - self.ended_dict[group_id] < reply_window:
+                # Keep only lightweight state long enough to accept a late /update.
+                need_free = False
             if need_free:
                 self.logger.debug(f'视频组{group_id}处理完成，视频信息已被释放.')
                 self.ended_dict.pop(group_id)
                 self.state_dict.pop(group_id)
                 self.ai_rename_dict.pop(group_id, None)
                 self.bv_title_dict.pop(group_id, None)
+                self.bv_manual_game_dict.pop(group_id, None)
                 self.upload_request_dict = {
                     request_id: upload
                     for request_id, upload in self.upload_request_dict.items()
@@ -570,12 +637,18 @@ class LiveEvents(BaseEvents):
                 }
 
         for group_id in list(self.ended_dict.keys()):
-            if time.time() - self.ended_dict[group_id] > 72*3600:
+            tg_config = self.config.get('ai_rename_args', {}).get('tg') or {}
+            if isinstance(tg_config, str):
+                tg_config = {'enabled': True}
+            reply_window = max(0, float(tg_config.get('reply_window', 86400)))
+            state_timeout = max(72 * 3600, reply_window)
+            if time.time() - self.ended_dict[group_id] > state_timeout:
                 self.logger.debug(f'视频组{group_id}处理超时，视频信息将被释放.')
                 self.ended_dict.pop(group_id)
                 self.state_dict.pop(group_id)
                 self.ai_rename_dict.pop(group_id, None)
                 self.bv_title_dict.pop(group_id, None)
+                self.bv_manual_game_dict.pop(group_id, None)
                 self.upload_request_dict = {
                     request_id: upload
                     for request_id, upload in self.upload_request_dict.items()
@@ -594,7 +667,7 @@ class LiveEvents(BaseEvents):
                 'engine': data.get('engine') or upload.get('engine'),
                 'upload_group': data.get('upload_group') or upload.get('upload_group'),
             })
-            title_state = self.bv_title_dict.setdefault(group_id, {'uploads': {}, 'queued': set()})
+            title_state = self.bv_title_dict.setdefault(group_id, {'uploads': {}, 'queued': {}})
             existing_upload = title_state['uploads'].get(upload['upload_group'])
             if existing_upload:
                 # A realtime BV is created by the first segment. Keep that segment's
@@ -633,6 +706,7 @@ class LiveEvents(BaseEvents):
         self.ended_dict.clear()
         self.upload_request_dict.clear()
         self.bv_title_dict.clear()
+        self.bv_manual_game_dict.clear()
         return PipeMessage(
             source=self.name,
             target='downloader',

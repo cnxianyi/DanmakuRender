@@ -57,7 +57,27 @@ ai_rename_args:
   extra_body: {}
   # 留空时使用程序内置提示词
   prompt: ~
-  # 开启后直接使用 game，不截图、不请求 AI
+  # 可选：把每个视频的所有截图作为一个 Telegram 相册发送
+  # 也支持简写：tg: '123456:ABCDEF'；此时会从机器人最近更新自动发现 chat_id
+  tg:
+    enabled: false
+    # BotFather 提供的机器人 Token；也可以使用字段名 token
+    bot_token: ~
+    # 私聊、群组或频道 ID；群组/频道通常是以 -100 开头的数字
+    chat_id: ~
+    # 话题群的 topic ID，普通聊天留空
+    message_thread_id: ~
+    caption: "{TASKNAME} | 分段 {SEGMENT_ID} | {GAME}\n回复本相册中的任意图片：/update 游戏名"
+    disable_notification: false
+    api_base: https://api.telegram.org
+    timeout: 60
+    # 接收 /update 回复的长轮询时长，以及相册回复保持有效的秒数
+    poll_timeout: 20
+    poll_retry_interval: 5
+    reply_window: 86400
+    retries: 2
+    retry_interval: 2
+  # 开启后默认使用 game，不请求 AI；tg.enabled 开启时仍会截图供人工确认
   fixed_game: false
   game: ''
   # rename_files 开启时默认只重命名弹幕版；不渲染弹幕版时可改为 [src_video]

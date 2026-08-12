@@ -14,7 +14,11 @@ from .utils import filename_to_taskname
 def _redact_sensitive_config(value):
     if isinstance(value, dict):
         return {
-            key: '***' if key == 'api_key' and item else _redact_sensitive_config(item)
+            key: '***' if item and (
+                str(key).lower() in ('api_key', 'bot_token', 'token')
+                or (str(key).lower() == 'tg' and isinstance(item, str))
+            )
+            else _redact_sensitive_config(item)
             for key, item in value.items()
         }
     if isinstance(value, list):
@@ -54,8 +58,11 @@ class DanmakuRender():
 
     def _ensure_task_plugins(self, replay_config):
         ai_args = replay_config.get('ai_rename_args', {})
+        tg_config = ai_args.get('tg')
+        tg_enabled = bool(tg_config) if isinstance(tg_config, str) \
+            else bool((tg_config or {}).get('enabled'))
         if replay_config['common_event_args'].get('ai_rename') and \
-                not ai_args.get('fixed_game') and \
+                (not ai_args.get('fixed_game') or tg_enabled) and \
                 'ai_rename' not in self.engine.plugin_dict:
             self.engine.add_plugin(
                 'ai_rename',

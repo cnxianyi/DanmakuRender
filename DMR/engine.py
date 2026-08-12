@@ -16,13 +16,20 @@ _SENSITIVE_KEYS = {
     'authorization',
     'access_token',
     'refresh_token',
+    'bot_token',
+    'token',
 }
 
 
 def _redact_sensitive_data(value):
     if isinstance(value, dict):
         return {
-            key: '***' if str(key).lower() in _SENSITIVE_KEYS and item else _redact_sensitive_data(item)
+            key: '***'
+            if item and (
+                str(key).lower() in _SENSITIVE_KEYS
+                or (str(key).lower() == 'tg' and isinstance(item, str))
+            )
+            else _redact_sensitive_data(item)
             for key, item in value.items()
         }
     if isinstance(value, (list, tuple)):

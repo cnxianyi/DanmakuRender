@@ -14,7 +14,14 @@ common_event_args:
 
 # AI 识别的任务级覆盖配置（可选）
 ai_rename_args:
-  # 开启后直接使用固定游戏名，不截图、不请求 AI
+  # 开启后，每个视频的三张 AI 截图会作为一个 Telegram 相册发送
+  tg:
+      enabled: false
+      bot_token: ~
+      chat_id: ~
+      # 回复相册中的图片：/update 瓦，可将整条 BV 的前缀覆盖为【瓦】
+      reply_window: 86400
+    # 开启后默认使用固定游戏名；Telegram 开启时仍会截图供人工确认
   fixed_game: false
   game: '三角洲行动'
   rename_files: false

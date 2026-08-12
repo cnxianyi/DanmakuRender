@@ -34,6 +34,8 @@ class Uploader():
         
         self.upload_executors = ThreadPoolExecutor(max_workers=self.nuploaders)
         self._lock = threading.Lock()
+        self._bv_title_locks = {}
+        self._latest_bv_title_requests = {}
 
     def load_failed_tasks(self):
         if exists(self.failed_tasks_file):
@@ -109,7 +111,7 @@ class Uploader():
                     if message.event == 'newtask':
                         self.add_task(message)
                     elif message.event == 'edit_bv_title':
-                        self.upload_executors.submit(self._edit_bv_title, message)
+                        self._queue_bv_title_edit(message)
             except Exception as e:
                 self.logger.error(f'Message:{message} raise an error.')
                 self.logger.exception(e)
@@ -184,30 +186,52 @@ class Uploader():
                     data=data or {},
                 )
 
-    def _edit_bv_title(self, message:PipeMessage):
+    def _queue_bv_title_edit(self, message:PipeMessage):
+        bvid = (message.data or {}).get('bvid')
+        with self._lock:
+            self._latest_bv_title_requests[bvid] = message.request_id
+            title_lock = self._bv_title_locks.setdefault(bvid, threading.Lock())
+        self.upload_executors.submit(self._edit_bv_title, message, title_lock)
+
+    def _is_latest_bv_title_request(self, bvid, request_id):
+        with self._lock:
+            return self._latest_bv_title_requests.get(bvid) == request_id
+
+    def _edit_bv_title(self, message:PipeMessage, title_lock=None):
         config = message.data or {}
         bvid = config.get('bvid')
         title = config.get('title')
         delay = max(0, float(config.get('delay', 10)))
         retries = max(0, int(config.get('retries', 2)))
         retry_interval = max(1, float(config.get('retry_interval', 30)))
+        title_lock = title_lock or self._bv_title_locks.setdefault(bvid, threading.Lock())
         try:
             from DMR.AIRename.bvtitle import update_bilibili_title
 
             if delay:
                 time.sleep(delay)
-            for attempt in range(retries + 1):
-                try:
-                    changed = update_bilibili_title(bvid, title, config.get('args') or {})
-                    break
-                except Exception:
-                    if attempt >= retries:
-                        raise
-                    self.logger.warning(
-                        f'B 站稿件 {bvid} 标题修改失败，'
-                        f'{retry_interval:g} 秒后重试 ({attempt + 1}/{retries}).'
-                    )
-                    time.sleep(retry_interval)
+            with title_lock:
+                if not self._is_latest_bv_title_request(bvid, message.request_id):
+                    self.logger.info(f'跳过 B 站稿件 {bvid} 已过时的标题修改任务: {title}')
+                    return
+                for attempt in range(retries + 1):
+                    if not self._is_latest_bv_title_request(bvid, message.request_id):
+                        self.logger.info(f'停止 B 站稿件 {bvid} 已过时的标题修改任务: {title}')
+                        return
+                    try:
+                        changed = update_bilibili_title(bvid, title, config.get('args') or {})
+                        break
+                    except Exception:
+                        if attempt >= retries:
+                            raise
+                        if not self._is_latest_bv_title_request(bvid, message.request_id):
+                            self.logger.info(f'停止重试 B 站稿件 {bvid} 已过时的标题修改任务: {title}')
+                            return
+                        self.logger.warning(
+                            f'B 站稿件 {bvid} 标题修改失败，'
+                            f'{retry_interval:g} 秒后重试 ({attempt + 1}/{retries}).'
+                        )
+                        time.sleep(retry_interval)
             action = '已修改' if changed else '无需修改'
             self._pipeSend(
                 event='title/end',
@@ -227,6 +251,10 @@ class Uploader():
                 dtype=str(type(e)),
                 data={'bvid': bvid, 'title': title, 'error': str(e)},
             )
+        finally:
+            with self._lock:
+                if self._latest_bv_title_requests.get(bvid) == message.request_id:
+                    self._latest_bv_title_requests.pop(bvid, None)
 
     def _upload_subprocess(self, task):
         task['status'] = 'uploading'

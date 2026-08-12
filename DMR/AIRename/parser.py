@@ -26,7 +26,8 @@ def _clean_json_text(text):
     return text.strip()
 
 
-def _normalize_game(value, config):
+def normalize_game(value, config=None):
+    config = config or {}
     if not isinstance(value, str):
         return ''
     value = re.sub(r'\s+', ' ', value).strip().strip('"\'`[]【】')
@@ -36,6 +37,10 @@ def _normalize_game(value, config):
         return ''
     max_length = max(1, int(config.get('max_game_name_length', 10)))
     return value[:max_length]
+
+
+# Kept as an internal alias for older callers and caches.
+_normalize_game = normalize_game
 
 
 def _majority(games):
@@ -57,7 +62,7 @@ def fixed_game_result(config=None):
     if not config.get('fixed_game'):
         return None
 
-    game = _normalize_game(config.get('game', ''), config)
+    game = normalize_game(config.get('game', ''), config)
     positions = config.get('frame_positions', [0.33, 0.66, 0.99])
     frame_count = len(positions) if isinstance(positions, (list, tuple)) and positions else 3
     return {
@@ -80,6 +85,6 @@ def parse_game_result(text, config=None):
 
     if not isinstance(raw_games, list):
         raise ValueError('AI 返回的 games 必须是数组')
-    games = [_normalize_game(game, config) for game in raw_games]
-    main_game = _normalize_game(raw_main_game, config) or _majority(games)
+    games = [normalize_game(game, config) for game in raw_games]
+    main_game = normalize_game(raw_main_game, config) or _majority(games)
     return {'games': games, 'main_game': main_game}
