@@ -619,7 +619,7 @@ class LiveEvents(BaseEvents):
             if isinstance(tg_config, str):
                 tg_config = {'enabled': True}
             reply_window = max(0, float(tg_config.get('reply_window', 86400)))
-            if need_free and config.get('update_bv_title') and tg_config.get('enabled') and reply_window and \
+            if need_free and self.config.get('ai_rename_args', {}).get('update_bv_title') and tg_config.get('enabled') and reply_window and \
                     time.time() - self.ended_dict[group_id] < reply_window:
                 # Keep only lightweight state long enough to accept a late /update.
                 need_free = False
