@@ -9,19 +9,19 @@ common_event_args:
   auto_clean: True
   # 原视频自动转码
   auto_transcode: False
-  # 使用 AI 识别视频中的主要游戏，并在最终 B 站标题添加游戏名前缀
+  # 使用固定游戏名或 Telegram 人工指定游戏名，并在最终 B 站标题添加前缀
   ai_rename: False
 
-# AI 识别的任务级覆盖配置（可选）
+# 游戏名处理的任务级覆盖配置（可选）
 ai_rename_args:
-  # 开启后，每个视频的三张 AI 截图会作为一个 Telegram 相册发送
+  # 开启后，每个视频发送一条 Telegram 文本消息，可回复 /update 游戏名
   tg:
       enabled: false
       bot_token: ~
       chat_id: ~
-      # 回复相册中的图片：/update 瓦，可将整条 BV 的前缀覆盖为【瓦】
+      # 回复此消息：/update 瓦，可将整条 BV 的前缀覆盖为【瓦】
       reply_window: 86400
-    # 开启后默认使用固定游戏名；Telegram 开启时仍会截图供人工确认
+    # 开启后默认使用固定游戏名；Telegram 开启时仍可人工覆盖
   fixed_game: false
   game: '三角洲行动'
   rename_files: false

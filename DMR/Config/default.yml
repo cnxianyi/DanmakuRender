@@ -21,43 +21,14 @@ dmr_engine_args:
 downloader_kernel_args:
   test: ~
 
-# AI 视频识别核心参数
+# 游戏名处理核心参数
 ai_rename_kernel_args:
-  # 同时执行的 AI 识别任务数
+  # 同时处理的 Telegram 通知任务数
   nworkers: 1
 
-# AI 视频识别与重命名默认参数
+# 游戏名处理与重命名默认参数
 ai_rename_args:
-  # OpenAI Chat Completions 兼容接口地址
-  base_url: https://api.openai.com/v1
-  # 也可以直接使用 endpoint 指定完整的 /chat/completions 地址
-  endpoint: ~
-  # API Key，程序会在写入调试日志时自动遮蔽该字段
-  api_key: ~
-  # 以下两项为可选兼容方式；api_key 优先级最高
-  api_key_env: AI_API_KEY
-  api_key_file: ~
-  # 必须填写支持图片输入的模型名称
-  model: ~
-  # 分别在视频的 33%、66%、99% 位置截图
-  frame_positions: [0.33, 0.66, 0.99]
-  image_format: jpg
-  max_image_width: 1280
-  image_detail: low
-  jpeg_quality: 3
-  screenshot_timeout: 30
-  # AI 请求参数
-  timeout: 60
-  retries: 2
-  temperature: 0
-  max_tokens: 300
-  # 部分兼容服务不支持 response_format，可设置为 false
-  response_format: true
-  headers: {}
-  extra_body: {}
-  # 留空时使用程序内置提示词
-  prompt: ~
-  # 可选：把每个视频的所有截图作为一个 Telegram 相册发送
+  # 可选：发送 Telegram 文本消息，回复 /update 游戏名可人工指定游戏
   # 也支持简写：tg: '123456:ABCDEF'；此时会从机器人最近更新自动发现 chat_id
   tg:
     enabled: false
@@ -67,17 +38,17 @@ ai_rename_args:
     chat_id: ~
     # 话题群的 topic ID，普通聊天留空
     message_thread_id: ~
-    caption: "{TASKNAME} | 分段 {SEGMENT_ID} | {GAME}\n回复本相册中的任意图片：/update 游戏名"
+    caption: "{TASKNAME} | 分段 {SEGMENT_ID} | {GAME}\n回复本消息：/update 游戏名"
     disable_notification: false
     api_base: https://api.telegram.org
     timeout: 60
-    # 接收 /update 回复的长轮询时长，以及相册回复保持有效的秒数
+    # 接收 /update 回复的长轮询时长，以及回复保持有效的秒数
     poll_timeout: 20
     poll_retry_interval: 5
     reply_window: 86400
     retries: 2
     retry_interval: 2
-  # 开启后默认使用 game，不请求 AI；tg.enabled 开启时仍会截图供人工确认
+  # 开启后直接使用 game；不会截图或请求 AI
   fixed_game: false
   game: ''
   # rename_files 开启时默认只重命名弹幕版；不渲染弹幕版时可改为 [src_video]
@@ -88,12 +59,7 @@ ai_rename_args:
   existing_prefix_pattern: '^【[^】]+】'
   max_game_name_length: 10
   excluded_names: []
-  # 识别结果缓存，避免重启后对同一文件重复请求
-  cache: true
-  cache_file: .temp/ai_rename_cache.json
-  # 当前仅支持 keep_original：失败时保留原名并继续上传
-  on_error: keep_original
-  # 整场直播上传完成后，按所有分段的三张截图结果统计并修改 BV 标题
+  # 整场直播上传完成后，按各分段的游戏名修改 BV 标题
   update_bv_title: false
   bv_title_count_source: games
   bv_title_template: '【{GAMES}】{TITLE}'

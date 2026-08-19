@@ -88,26 +88,13 @@ class LiveEvents(BaseEvents):
                     self.logger.info(f'{self.name}: 使用固定游戏名: {ai_state["main_game"]}.')
                 else:
                     self.logger.warning(f'{self.name}: fixed_game 已开启，但 game 为空或被过滤.')
-                if tg_enabled:
-                    ai_request_id = uuid()
-                    ai_state.update({'status': 'recognizing', 'request_id': ai_request_id})
-                    ret_msgs.append(PipeMessage(
-                        source=self.name,
-                        target='ai_rename',
-                        event='newtask',
-                        request_id=ai_request_id,
-                        data={
-                            'taskname': self.name,
-                            'video': video,
-                            'args': {
-                                **ai_args,
-                                '_fixed_result': fixed_result,
-                            },
-                        },
-                    ))
             else:
+                # Automatic screenshot/vision recognition has been removed.
+                # Without a fixed game, the segment continues without a game name.
+                ai_state['status'] = 'ready'
+            if tg_enabled:
                 ai_request_id = uuid()
-                ai_state.update({'status': 'recognizing', 'request_id': ai_request_id})
+                ai_state['request_id'] = ai_request_id
                 ret_msgs.append(PipeMessage(
                     source=self.name,
                     target='ai_rename',
@@ -116,7 +103,10 @@ class LiveEvents(BaseEvents):
                     data={
                         'taskname': self.name,
                         'video': video,
-                        'args': ai_args,
+                        'args': {
+                            **ai_args,
+                            '_fixed_result': fixed_result,
+                        },
                     },
                 ))
         self.ai_rename_dict.setdefault(video.group_id, []).append(ai_state)
@@ -474,9 +464,9 @@ class LiveEvents(BaseEvents):
                 try:
                     new_path = rename_video(info['file'], ai_state['main_game'], config)
                     if new_path != old_path:
-                        self.logger.info(f'视频已根据 AI 识别结果重命名: {old_path} -> {new_path}')
+                        self.logger.info(f'视频已根据游戏名重命名: {old_path} -> {new_path}')
                 except Exception as e:
-                    self.logger.warning(f'视频 {old_path} AI 重命名失败，将保留原文件名: {e}')
+                    self.logger.warning(f'视频 {old_path} 游戏名重命名失败，将保留原文件名: {e}')
                 finally:
                     # 重命名失败也必须放行上传，不能让后处理链永久等待。
                     ai_state['renamed_types'].add(vtype)
@@ -488,7 +478,7 @@ class LiveEvents(BaseEvents):
             ai_state = self.ai_rename_dict[group_id][idx]
         except (KeyError, IndexError):
             return False
-        # AI 使用原视频截图；识别完成前不能让任一文件进入上传后清理阶段。
+        # 保留该状态检查，兼容旧状态或尚未完成的 Telegram 通知任务。
         if ai_state['status'] == 'recognizing':
             return False
         if vtype not in self._ai_target_types():

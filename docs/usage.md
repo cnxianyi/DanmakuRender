@@ -146,7 +146,7 @@ common_event_args:
   auto_clean: False
   # 原视频自动转码（可以用于给原视频做伪4K）
   auto_transcode: False
-  # 使用视觉AI识别视频中的主要游戏，并在最终 B 站标题添加游戏名前缀
+  # 使用固定游戏名或 Telegram 人工指定游戏名，并在最终 B 站标题添加前缀
   ai_rename: False
 
 
@@ -168,16 +168,16 @@ render_args:
   transcode:
     ...
 
-# 单独的AI识别设置（可选）
+# 单独的游戏名处理设置（可选）
 # 未设置的字段会继承全局 ai_rename_args
 ai_rename_args:
-  # 将每个视频的全部截图作为一个 Telegram 相册发送
+  # 将每个视频的游戏名确认消息发送到 Telegram
   tg:
     enabled: false
     bot_token: '123456:ABCDEF'
     chat_id: '-1001234567890'
     reply_window: 86400
-  # 开启后默认使用固定游戏名；Telegram 开启时仍会截图供人工确认
+  # 开启后默认使用固定游戏名；Telegram 开启时仍可人工覆盖
   fixed_game: false
   game: '三角洲行动'
   # rename_files 开启时默认只重命名弹幕版；不渲染弹幕版时应设置为 [src_video]
@@ -214,22 +214,20 @@ clean:
     ...
 ```
 
-**AI识别与 B 站标题说明**
-开启`ai_rename`后，每个录制分段完成时会从原视频的33%、66%、99%位置截图，并通过OpenAI Chat Completions兼容接口识别主要游戏。截图完成前会暂缓该分段进入上传和清理流程；识别或请求失败时保留原名并继续处理，不影响录制。默认`rename_files: false`，本地视频文件名保持不变；开启`rename_files: true`后，才会按`target_types`给本地文件名添加游戏前缀。
+**游戏名与 B 站标题说明**
+开启`ai_rename`后，程序不会截图，也不会调用视觉 AI。未设置`fixed_game`时，该分段不产生游戏名并立即继续上传；设置`fixed_game: true`后，直接使用`game`作为游戏名。默认`rename_files: false`，本地视频文件名保持不变；开启`rename_files: true`后，才会按`target_types`给本地文件名添加游戏前缀。
 ```text
 oyo-2026年08月01日00点39分（弹幕版）.mp4
 -> 【三角洲行动】oyo-2026年08月01日00点39分（弹幕版）.mp4
 ```
 上面的文件名示例仅在`rename_files: true`时生效；默认不会修改本地文件名。
-在`configs/global.yml`中填写`base_url`、支持图片输入的`model`和`api_key`。程序在写入调试日志时会把`api_key`显示为`***`。若接口不支持JSON响应格式，可设置`response_format: false`。
+开启`tg.enabled`后，每个视频会通过 Telegram Bot API 发送一条游戏名确认消息。推荐同时填写机器人`bot_token`（也支持字段`token`）和接收方`chat_id`；也可以直接写`tg: '123456:ABCDEF'`，程序会从机器人最近更新中自动发现唯一聊天，此时需要先向机器人发送一次`/start`。回复该消息`/update 游戏名`即可人工指定游戏名。发送失败只记录警告，不会中断录制或上传。Token会在调试日志中显示为`***`。
 
-开启`tg.enabled`后，每个视频在33%、66%、99%位置生成的截图会通过 Telegram Bot API 的媒体组作为一个相册发送。推荐同时填写机器人`bot_token`（也支持字段`token`）和接收方`chat_id`；也可以直接写`tg: '123456:ABCDEF'`，程序会从机器人最近更新中自动发现唯一聊天，此时需要先向机器人发送一次`/start`。发送失败只记录警告，不会中断AI识别、录制或上传。固定游戏模式下仍会截图并发送，但不会请求AI。Token会在调试日志中显示为`***`。
-
-相册发出后，回复其中任意一张图片并发送`/update 游戏名`，会把该场直播整条 BV 的游戏前缀人工覆盖为这个名字。例如配置`fixed_game: true`和`game: '三角洲行动'`时，未回复会使用默认前缀`【三角洲行动】`；回复`/update 瓦`后会改为`【瓦】`。其他回复不会修改标题。游戏名仍受`max_game_name_length`限制（默认10个字）。`reply_window`控制相册回复有效期，默认86400秒；若上传已完成但仍在有效期内，标题会再次修改，目标标题相同时不会重复提交。
+确认消息发出后，回复该消息并发送`/update 游戏名`，会把该场直播整条 BV 的游戏前缀人工覆盖为这个名字。例如配置`fixed_game: true`和`game: '三角洲行动'`时，未回复会使用默认前缀`【三角洲行动】`；回复`/update 瓦`后会改为`【瓦】`。其他回复不会修改标题。游戏名仍受`max_game_name_length`限制（默认10个字）。`reply_window`控制回复有效期，默认86400秒；若上传已完成但仍在有效期内，标题会再次修改，目标标题相同时不会重复提交。
 
 开启`update_bv_title`后，程序会在整场直播的最后一个上传任务完成后，统计所有分段`games`数组中的非空游戏名，按出现次数降序生成标题。例如三角洲行动8次、幻兽帕鲁4次，则生成`【三角洲行动|幻兽帕鲁】{TITLE}`。该功能目前仅对 B 站上传生效；所有识别结果都为空时不修改标题。
 
-开启`fixed_game`后，程序不会调用 AI，而是直接把`game`作为每个分段的默认游戏名。未开启 Telegram 时也不会截图；开启`tg.enabled`后仍会截图并发送，供人工用`/update`覆盖。默认仅更新 BV 标题；本地文件名前缀只有在同时开启`rename_files`时才会执行。`fixed_game`只有在任务同时开启`common_event_args.ai_rename`时生效。
+开启`fixed_game`后，程序不会截图或调用 AI，而是直接把`game`作为每个分段的默认游戏名。开启`tg.enabled`后会额外发送文本消息，供人工用`/update`覆盖。默认仅更新 BV 标题；本地文件名前缀只有在同时开启`rename_files`时才会执行。`fixed_game`只有在任务同时开启`common_event_args.ai_rename`时生效。
 
 **自动上传的配置格式说明**      
 每个视频类型都可以指定一个或者多个上传任务，组成一个数组。特别地，如果只上传一个地方，则可以直接指定参数，不必使用数组，示例如下：

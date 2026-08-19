@@ -1,9 +1,6 @@
 import json
-import mimetypes
-import os
 import re
 import time
-from contextlib import ExitStack
 
 import requests
 
@@ -58,12 +55,10 @@ def _discover_chat_id(token, tg_config, timeout):
     return chat_ids[0]
 
 
-def _request_data(tg_config, caption):
+def _request_data(tg_config):
     data = {
         'chat_id': str(tg_config.get('chat_id') or '').strip(),
     }
-    if caption:
-        data['caption'] = str(caption)[:1024]
     message_thread_id = tg_config.get('message_thread_id')
     if message_thread_id not in (None, ''):
         data['message_thread_id'] = str(message_thread_id)
@@ -72,45 +67,37 @@ def _request_data(tg_config, caption):
     return data
 
 
-def _post_album(frame_paths, tg_config, caption, timeout):
+def _send_message_once(tg_config, caption, timeout):
     token = str(tg_config.get('bot_token') or tg_config.get('token') or '').strip()
     api_base = str(tg_config.get('api_base') or 'https://api.telegram.org').rstrip('/')
-    url = f'{api_base}/bot{token}/sendMediaGroup'
-    data = _request_data(tg_config, '')
-    media = []
-
-    with ExitStack() as stack:
-        files = {}
-        for index, frame_path in enumerate(frame_paths):
-            field = f'frame{index}'
-            item = {'type': 'photo', 'media': f'attach://{field}'}
-            if index == 0 and caption:
-                item['caption'] = str(caption)[:1024]
-            media.append(item)
-            mime_type = mimetypes.guess_type(frame_path)[0] or 'image/jpeg'
-            file_handle = stack.enter_context(open(frame_path, 'rb'))
-            files[field] = (os.path.basename(frame_path), file_handle, mime_type)
-        data['media'] = json.dumps(media, ensure_ascii=False)
-        return requests.post(url, data=data, files=files, timeout=timeout)
-
-
-def _post_photo(frame_path, tg_config, caption, timeout):
-    token = str(tg_config.get('bot_token') or tg_config.get('token') or '').strip()
-    api_base = str(tg_config.get('api_base') or 'https://api.telegram.org').rstrip('/')
-    url = f'{api_base}/bot{token}/sendPhoto'
-    data = _request_data(tg_config, caption)
-    mime_type = mimetypes.guess_type(frame_path)[0] or 'image/jpeg'
-    with open(frame_path, 'rb') as file_handle:
-        return requests.post(
-            url,
-            data=data,
-            files={'photo': (os.path.basename(frame_path), file_handle, mime_type)},
-            timeout=timeout,
-        )
+    url = f'{api_base}/bot{token}/sendMessage'
+    data = _request_data(tg_config)
+    data['text'] = str(caption)[:4096]
+    response = requests.post(
+        url,
+        data=data,
+        timeout=timeout,
+    )
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+    if not response.ok or not isinstance(body, dict) or not body.get('ok'):
+        description = body.get('description') if isinstance(body, dict) else response.text[:300]
+        raise RuntimeError(f'HTTP {response.status_code}: {description}')
+    message = body.get('result') or {}
+    message_id = message.get('message_id')
+    if message_id is None:
+        raise RuntimeError('Telegram sendMessage 未返回 message_id')
+    return {
+        'chat_id': str((message.get('chat') or {}).get('id') or tg_config.get('chat_id')),
+        'message_ids': [message_id],
+        'media_group_id': None,
+    }
 
 
-def send_frame_album(frame_paths, config, caption=''):
-    """Send one video's screenshots as one Telegram media group."""
+def send_game_prompt(config, caption=''):
+    """Send a text prompt that can be replied to with a manual game name."""
     tg_config = telegram_config(config)
     if not telegram_enabled(config):
         return None
@@ -119,64 +106,25 @@ def send_frame_album(frame_paths, config, caption=''):
     chat_id = str(tg_config.get('chat_id') or '').strip()
     if not token:
         raise ValueError('tg.bot_token（或 tg.token）未配置')
-    if not frame_paths:
-        raise ValueError('没有可发送的截图')
-    if len(frame_paths) > 10:
-        raise ValueError('Telegram 单个媒体组最多支持 10 张图片')
-
-    timeout = max(1, float(tg_config.get('timeout', 60)))
     if not chat_id:
         try:
-            chat_id = _discover_chat_id(token, tg_config, timeout)
+            chat_id = _discover_chat_id(token, tg_config, max(1, float(tg_config.get('timeout', 60))))
         except Exception as error:
             raise RuntimeError(str(error).replace(token, '***')) from None
         tg_config = {**tg_config, 'chat_id': chat_id}
+
+    timeout = max(1, float(tg_config.get('timeout', 60)))
     retries = max(0, int(tg_config.get('retries', 2)))
     retry_interval = max(0, float(tg_config.get('retry_interval', 2)))
     last_error = None
-
     for attempt in range(retries + 1):
         try:
-            if len(frame_paths) == 1:
-                response = _post_photo(frame_paths[0], tg_config, caption, timeout)
-            else:
-                response = _post_album(frame_paths, tg_config, caption, timeout)
-            try:
-                body = response.json()
-            except ValueError:
-                body = None
-            if response.ok and isinstance(body, dict) and body.get('ok'):
-                messages = body.get('result') or []
-                if isinstance(messages, dict):
-                    messages = [messages]
-                message_ids = [
-                    message.get('message_id')
-                    for message in messages
-                    if isinstance(message, dict) and message.get('message_id') is not None
-                ]
-                media_group_id = next((
-                    message.get('media_group_id')
-                    for message in messages
-                    if isinstance(message, dict) and message.get('media_group_id')
-                ), None)
-                result_chat_id = next((
-                    (message.get('chat') or {}).get('id')
-                    for message in messages
-                    if isinstance(message, dict) and (message.get('chat') or {}).get('id') is not None
-                ), chat_id)
-                return {
-                    'chat_id': str(result_chat_id),
-                    'message_ids': message_ids,
-                    'media_group_id': media_group_id,
-                }
-            description = body.get('description') if isinstance(body, dict) else response.text[:300]
-            raise RuntimeError(f'HTTP {response.status_code}: {description}')
+            return _send_message_once(tg_config, caption, timeout)
         except (OSError, requests.RequestException, RuntimeError) as error:
             last_error = str(error).replace(token, '***')
             if attempt < retries and retry_interval:
                 time.sleep(retry_interval)
-
-    raise RuntimeError(f'Telegram 图片发送失败: {last_error}')
+    raise RuntimeError(f'Telegram 游戏名确认消息发送失败: {last_error}')
 
 
 def get_updates(config, offset=None):

@@ -1,49 +1,23 @@
 import os
-import json
 import tempfile
 import unittest
-from types import SimpleNamespace
 from unittest.mock import patch
 
-import requests
-
 from DMR.AIRename.bvtitle import build_bv_title, rank_games
-from DMR.AIRename.client import OpenAICompatibleVisionClient
 from DMR import _redact_sensitive_config
 from DMR.engine import _redact_sensitive_data
-from DMR.AIRename.frames import extract_frames
 from DMR.AIRename.naming import rename_video
-from DMR.AIRename.parser import fixed_game_result, parse_game_result
-from DMR.AIRename.telegram import parse_update_reply, send_frame_album, telegram_config
+from DMR.AIRename.parser import fixed_game_result
+from DMR.AIRename.telegram import (
+    parse_update_reply,
+    send_game_prompt,
+    telegram_config,
+)
 from DMR.Task.liveevents import LiveEvents
 from DMR.utils import PipeMessage, VideoInfo
 
 
-class AIRenameParserTests(unittest.TestCase):
-    def test_parses_json_object(self):
-        result = parse_game_result(
-            '```json\n{"games":["三角洲行动","三角洲行动",""],'
-            '"main_game":"三角洲行动"}\n```'
-        )
-        self.assertEqual(result['games'], ['三角洲行动', '三角洲行动', ''])
-        self.assertEqual(result['main_game'], '三角洲行动')
-
-    def test_accepts_ordered_array_and_uses_majority(self):
-        result = parse_game_result('结果如下：["原神", "", "原神"]')
-        self.assertEqual(result['main_game'], '原神')
-
-    def test_non_game_names_become_empty(self):
-        result = parse_game_result(
-            '{"games":["Windows桌面","浏览器","抖音"],"main_game":"无法判断"}'
-        )
-        self.assertEqual(result, {'games': ['', '', ''], 'main_game': ''})
-
-    def test_game_names_are_limited_to_ten_characters(self):
-        result = parse_game_result(
-            '{"games":["这是一个超过十个字的游戏名称"],"main_game":""}'
-        )
-        self.assertEqual(result['games'], ['这是一个超过十个字的'])
-
+class GameNameParserTests(unittest.TestCase):
     def test_fixed_game_returns_three_normalized_results(self):
         result = fixed_game_result({
             'fixed_game': True,
@@ -51,7 +25,7 @@ class AIRenameParserTests(unittest.TestCase):
         })
 
         self.assertEqual(result, {
-            'games': ['这是一个超过十个字的'] * 3,
+            'games': ['这是一个超过十个字的'],
             'main_game': '这是一个超过十个字的',
         })
 
@@ -59,44 +33,14 @@ class AIRenameParserTests(unittest.TestCase):
         self.assertIsNone(fixed_game_result({'fixed_game': False, 'game': '三角洲行动'}))
 
 
-class AIRenameClientTests(unittest.TestCase):
-    def test_reads_api_key_directly_from_config(self):
-        client = OpenAICompatibleVisionClient({'api_key': 'yaml-key'})
-        self.assertEqual(client._api_key(), 'yaml-key')
-
-    @patch('DMR.AIRename.client.requests.post')
-    def test_non_json_response_reports_http_context(self, post):
-        response = post.return_value
-        response.status_code = 200
-        response.headers = {'Content-Type': 'text/html'}
-        response.text = '<html>wrong endpoint</html>'
-        response.raise_for_status.return_value = None
-        response.json.side_effect = requests.exceptions.JSONDecodeError('bad json', '', 0)
-        client = OpenAICompatibleVisionClient({
-            'api_key': 'yaml-key',
-            'model': 'vision-model',
-            'endpoint': 'https://example.test/chat/completions',
-            'retries': 0,
-        })
-
-        with self.assertRaisesRegex(RuntimeError, 'HTTP 200.*text/html'):
-            client.recognize([])
-
-
 class SensitiveLoggingTests(unittest.TestCase):
-    def test_redacts_nested_api_credentials(self):
+    def test_redacts_nested_telegram_credentials(self):
         result = _redact_sensitive_data({
             'args': {
-                'api_key': 'secret',
-                'headers': {'Authorization': 'Bearer secret'},
-                'api_key_env': 'AI_API_KEY',
                 'tg': {'bot_token': 'telegram-secret'},
             },
         })
 
-        self.assertEqual(result['args']['api_key'], '***')
-        self.assertEqual(result['args']['headers']['Authorization'], '***')
-        self.assertEqual(result['args']['api_key_env'], 'AI_API_KEY')
         self.assertEqual(result['args']['tg']['bot_token'], '***')
 
     def test_redacts_telegram_token_shorthand(self):
@@ -111,61 +55,14 @@ class SensitiveLoggingTests(unittest.TestCase):
         )
 
 
-class TelegramAlbumTests(unittest.TestCase):
+class TelegramTests(unittest.TestCase):
     def test_accepts_token_only_shorthand(self):
         self.assertEqual(
             telegram_config({'tg': '123456:ABCDEF'}),
             {'enabled': True, 'bot_token': '123456:ABCDEF'},
         )
 
-    @patch('DMR.AIRename.telegram.requests.post')
-    def test_sends_all_frames_as_one_media_group(self, post):
-        post.return_value.ok = True
-        post.return_value.json.return_value = {
-            'ok': True,
-            'result': [
-                {
-                    'message_id': message_id,
-                    'media_group_id': 'album-1',
-                    'chat': {'id': -100123456},
-                }
-                for message_id in (101, 102, 103)
-            ],
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            frame_paths = []
-            for index in range(3):
-                frame_path = os.path.join(directory, f'frame-{index}.jpg')
-                with open(frame_path, 'wb') as file:
-                    file.write(b'image')
-                frame_paths.append(frame_path)
-
-            sent = send_frame_album(frame_paths, {
-                'tg': {
-                    'enabled': True,
-                    'bot_token': 'telegram-token',
-                    'chat_id': '-100123456',
-                    'retries': 0,
-                },
-            }, caption='test caption')
-
-        self.assertEqual(sent, {
-            'chat_id': '-100123456',
-            'message_ids': [101, 102, 103],
-            'media_group_id': 'album-1',
-        })
-        self.assertEqual(post.call_count, 1)
-        url = post.call_args.args[0]
-        kwargs = post.call_args.kwargs
-        media = json.loads(kwargs['data']['media'])
-        self.assertTrue(url.endswith('/bottelegram-token/sendMediaGroup'))
-        self.assertEqual(kwargs['data']['chat_id'], '-100123456')
-        self.assertEqual(len(kwargs['files']), 3)
-        self.assertEqual(len(media), 3)
-        self.assertEqual(media[0]['caption'], 'test caption')
-        self.assertNotIn('caption', media[1])
-
-    def test_parses_update_only_when_replying_to_album_message(self):
+    def test_parses_update_only_when_replying_to_notification(self):
         command = parse_update_reply({
             'update_id': 88,
             'message': {
@@ -190,13 +87,41 @@ class TelegramAlbumTests(unittest.TestCase):
             },
         }))
 
+    @patch('DMR.AIRename.telegram.requests.post')
+    def test_sends_text_prompt_and_returns_message_id(self, post):
+        post.return_value.ok = True
+        post.return_value.json.return_value = {
+            'ok': True,
+            'result': {
+                'message_id': 301,
+                'chat': {'id': 123456},
+            },
+        }
+
+        sent = send_game_prompt({
+            'tg': {
+                'enabled': True,
+                'bot_token': 'telegram-token',
+                'chat_id': '123456',
+                'retries': 0,
+            },
+        }, caption='reply with /update game')
+
+        self.assertEqual(sent, {
+            'chat_id': '123456',
+            'message_ids': [301],
+            'media_group_id': None,
+        })
+        self.assertTrue(post.call_args.args[0].endswith('/bottelegram-token/sendMessage'))
+        self.assertEqual(post.call_args.kwargs['data']['text'], 'reply with /update game')
+
 
 class BVTitleTests(unittest.TestCase):
-    def test_ranks_all_segment_frame_results_by_count(self):
+    def test_ranks_segment_game_names_by_count(self):
         states = [
-            {'games': ['三角洲行动', '三角洲行动', '幻兽帕鲁']},
-            {'games': ['幻兽帕鲁', '三角洲行动', '']},
-            {'games': ['三角洲行动', '幻兽帕鲁', '三角洲行动']},
+            {'games': ['三角洲行动']},
+            {'games': ['幻兽帕鲁']},
+            {'games': ['三角洲行动']},
         ]
 
         self.assertEqual(rank_games(states), ['三角洲行动', '幻兽帕鲁'])
@@ -215,14 +140,12 @@ class BVTitleTests(unittest.TestCase):
         title, games = build_bv_title('original', [{'games': ['', '', '']}], {})
         self.assertEqual((title, games), ('', []))
 
-    def test_title_uses_at_most_two_games_and_truncates_old_cache_names(self):
-        states = [{
-            'games': [
-                '这是一个超过十个字的游戏名称',
-                '三角洲行动',
-                '幻兽帕鲁',
-            ],
-        }]
+    def test_title_uses_at_most_two_games_and_truncates_long_names(self):
+        states = [
+            {'games': ['这是一个超过十个字的游戏名称']},
+            {'games': ['三角洲行动']},
+            {'games': ['幻兽帕鲁']},
+        ]
 
         title, games = build_bv_title('original', states, {})
 
@@ -256,35 +179,6 @@ class AIRenameNamingTests(unittest.TestCase):
             self.assertEqual(rename_video(video, '三角洲行动', {}), source)
 
 
-class AIRenameFrameTests(unittest.TestCase):
-    @patch('DMR.AIRename.frames.FFprobe.get_duration', return_value=3.0)
-    @patch('DMR.AIRename.frames.ToolsList.get', return_value='ffmpeg')
-    def test_last_frame_retries_one_second_earlier(self, _get_tool, _get_duration):
-        with tempfile.TemporaryDirectory() as directory:
-            video_path = os.path.join(directory, 'video.mp4')
-            frame_path = os.path.join(directory, 'frame.jpg')
-            open(video_path, 'wb').close()
-            timestamps = []
-
-            def fake_run(command, **kwargs):
-                timestamps.append(command[command.index('-ss') + 1])
-                if len(timestamps) == 2:
-                    with open(frame_path, 'wb') as f:
-                        f.write(b'frame')
-                    return SimpleNamespace(returncode=0, stderr=b'')
-                return SimpleNamespace(returncode=1, stderr=b'no frame')
-
-            with patch('DMR.AIRename.frames.get_tempfile', return_value=frame_path), \
-                    patch('DMR.AIRename.frames.subprocess.run', side_effect=fake_run):
-                frames = extract_frames(
-                    VideoInfo(path=video_path, duration=3),
-                    {'frame_positions': [0.99]},
-                )
-
-            self.assertEqual(frames, [frame_path])
-            self.assertEqual(timestamps, ['2.970', '2.000'])
-
-
 class LiveEventsAIRenameTests(unittest.TestCase):
     def _config(self):
         return {
@@ -299,7 +193,7 @@ class LiveEventsAIRenameTests(unittest.TestCase):
             'ai_rename_args': {'target_types': ['dm_video'], 'rename_files': True},
         }
 
-    def test_segment_queues_ai_and_blocks_upload_until_callback(self):
+    def test_segment_skips_automatic_recognition_and_allows_upload(self):
         events = LiveEvents('test', self._config())
         video = VideoInfo(
             path='input.flv',
@@ -315,8 +209,9 @@ class LiveEventsAIRenameTests(unittest.TestCase):
             data=video,
         ))
 
-        self.assertEqual(messages[0].target, 'ai_rename')
-        self.assertFalse(events._ai_rename_allows_upload('group', 0, 'src_video'))
+        self.assertFalse(any(message.target == 'ai_rename' for message in messages))
+        self.assertEqual(events.ai_rename_dict['group'][0]['status'], 'ready')
+        self.assertTrue(events._ai_rename_allows_upload('group', 0, 'src_video'))
 
     def test_fixed_game_skips_ai_request(self):
         config = self._config()
@@ -341,9 +236,9 @@ class LiveEventsAIRenameTests(unittest.TestCase):
 
         self.assertFalse(any(message.target == 'ai_rename' for message in messages))
         self.assertEqual(events.ai_rename_dict['group'][0]['status'], 'ready')
-        self.assertEqual(events.ai_rename_dict['group'][0]['games'], ['三角洲行动'] * 3)
+        self.assertEqual(events.ai_rename_dict['group'][0]['games'], ['三角洲行动'])
 
-    def test_fixed_game_with_telegram_queues_screenshot_task(self):
+    def test_fixed_game_with_telegram_queues_text_prompt(self):
         config = self._config()
         config['ai_rename_args'].update({
             'fixed_game': True,
@@ -371,7 +266,7 @@ class LiveEventsAIRenameTests(unittest.TestCase):
             ai_messages[0].data['args']['_fixed_result']['main_game'],
             '三角洲行动',
         )
-        self.assertEqual(events.ai_rename_dict['group'][0]['status'], 'recognizing')
+        self.assertEqual(events.ai_rename_dict['group'][0]['status'], 'ready')
 
     def test_ai_callback_renames_ready_target(self):
         with tempfile.TemporaryDirectory() as directory:

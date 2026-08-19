@@ -8,14 +8,11 @@ from typing import Tuple
 
 from DMR.utils import PipeMessage, VideoInfo, uuid
 
-from .cache import AIRenameCache
-from .client import OpenAICompatibleVisionClient
-from .frames import extract_frames
-from .parser import normalize_game, parse_game_result
+from .parser import normalize_game
 from .telegram import (
     get_updates,
     parse_update_reply,
-    send_frame_album,
+    send_game_prompt,
     telegram_config,
     telegram_enabled,
 )
@@ -58,7 +55,7 @@ class AIRename():
                     self.add_task(message)
             except Exception as e:
                 self.logger.error(
-                    f'AI rename message {message.event} ({message.request_id}) raised an error.'
+                    f'Game name message {message.event} ({message.request_id}) raised an error.'
                 )
                 self.logger.exception(e)
 
@@ -89,35 +86,14 @@ class AIRename():
             'games': [],
             'main_game': '',
         }
-        frame_paths = []
         try:
             fixed_result = args.get('_fixed_result')
             if fixed_result is not None:
-                frame_paths = extract_frames(video, args)
                 result.update(fixed_result)
-            else:
-                cache = AIRenameCache(args.get('cache_file', '.temp/ai_rename_cache.json'))
-                cache_key = cache.make_key(video, args)
-                cached = cache.get(cache_key) if args.get('cache', True) else None
-                # TG needs the actual files even when the AI result is already cached.
-                if cached is not None and not telegram_enabled(args):
-                    result.update(cached)
-                else:
-                    frame_paths = extract_frames(video, args)
-                    if cached is not None:
-                        result.update(cached)
-                    else:
-                        response_text = OpenAICompatibleVisionClient(args).recognize(frame_paths)
-                        result.update(parse_game_result(response_text, args))
-                    if cached is None and args.get('cache', True):
-                        cache.set(cache_key, {
-                            'games': result['games'],
-                            'main_game': result['main_game'],
-                        })
 
-            self._send_telegram_frames(task, frame_paths, result)
-            game = result['main_game'] or '未识别到游戏'
-            action = '固定游戏截图处理完成' if fixed_result is not None else 'AI 识别完成'
+            self._send_telegram_prompt(task, result)
+            game = result['main_game'] or '未设置游戏名'
+            action = '固定游戏处理完成' if fixed_result is not None else '游戏识别已停用'
             self._pipeSend(
                 event='end',
                 msg=f'视频 {video.path} {action}: {game}',
@@ -127,27 +103,19 @@ class AIRename():
             )
         except Exception as e:
             result['error'] = str(e)
-            if frame_paths:
-                self._send_telegram_frames(task, frame_paths, result)
-            self.logger.warning(f'视频 {video.path} AI/TG 处理失败，将保留原文件名: {e}')
+            self.logger.warning(f'视频 {video.path} TG 处理失败，将保留原文件名: {e}')
             self._pipeSend(
                 event='error',
-                msg=f'视频 {video.path} AI/TG 处理失败，将保留原文件名: {e}',
+                msg=f'视频 {video.path} TG 处理失败，将保留原文件名: {e}',
                 target=task['source'],
                 request_id=task['request_id'],
                 data=result,
             )
         finally:
-            for frame_path in frame_paths:
-                try:
-                    if os.path.exists(frame_path):
-                        os.remove(frame_path)
-                except OSError:
-                    self.logger.debug(f'无法删除 AI 截图临时文件: {frame_path}')
             with self._lock:
                 self._tasks.pop(task['uuid'], None)
 
-    def _send_telegram_frames(self, task, frame_paths, result):
+    def _send_telegram_prompt(self, task, result):
         video = task['video']
         args = task['args']
         if not telegram_enabled(args):
@@ -156,24 +124,24 @@ class AIRename():
             caption_template = telegram_config(args).get(
                 'caption',
                 '{TASKNAME} | 分段 {SEGMENT_ID} | {GAME}\n'
-                '回复本相册中的任意图片：/update 游戏名',
+                '回复本消息：/update 游戏名',
             )
             caption = str(caption_template).format(
                 TASKNAME=video.taskname or task['source'].split('/', 1)[-1],
                 SEGMENT_ID=video.segment_id if video.segment_id is not None else '',
-                GAME=result.get('main_game') or '未识别到游戏',
+                GAME=result.get('main_game') or '未设置游戏名',
                 BASENAME=os.path.basename(video.path),
             )
-            album = send_frame_album(frame_paths, args, caption=caption)
-            result['telegram'] = album
-            self._register_telegram_album(task, album)
-            self.logger.info(f'视频 {video.path} 的 {len(frame_paths)} 张截图已发送到 Telegram.')
+            notification = send_game_prompt(args, caption=caption)
+            result['telegram'] = notification
+            self._register_telegram_message(task, notification)
+            self.logger.info(f'视频 {video.path} 的 Telegram 游戏名确认消息已发送.')
         except Exception as error:
-            # Notifications must never block recognition, upload or recording.
-            self.logger.warning(f'视频 {video.path} 的 Telegram 截图发送失败: {error}')
+            # Notifications must never block renaming, upload or recording.
+            self.logger.warning(f'视频 {video.path} 的 Telegram 消息发送失败: {error}')
 
-    def _register_telegram_album(self, task, album):
-        if not album or not album.get('message_ids'):
+    def _register_telegram_message(self, task, notification):
+        if not notification or not notification.get('message_ids'):
             return
         args = task['args']
         tg_config = telegram_config(args)
@@ -195,8 +163,8 @@ class AIRename():
             'expires_at': time.time() + reply_window,
         }
         with self._lock:
-            for message_id in album['message_ids']:
-                self._telegram_targets[(monitor_key, str(album['chat_id']), message_id)] = target
+            for message_id in notification['message_ids']:
+                self._telegram_targets[(monitor_key, str(notification['chat_id']), message_id)] = target
             monitor = self._telegram_monitors.get(monitor_key)
             if monitor is None or not monitor.is_alive():
                 monitor = threading.Thread(
@@ -266,4 +234,4 @@ class AIRename():
     def stop(self):
         self.stoped = True
         self._executors.shutdown(wait=False)
-        self.logger.info('AI rename stopped.')
+        self.logger.info('Game name processor stopped.')

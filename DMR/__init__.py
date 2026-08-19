@@ -61,8 +61,7 @@ class DanmakuRender():
         tg_config = ai_args.get('tg')
         tg_enabled = bool(tg_config) if isinstance(tg_config, str) \
             else bool((tg_config or {}).get('enabled'))
-        if replay_config['common_event_args'].get('ai_rename') and \
-                (not ai_args.get('fixed_game') or tg_enabled) and \
+        if replay_config['common_event_args'].get('ai_rename') and tg_enabled and \
                 'ai_rename' not in self.engine.plugin_dict:
             self.engine.add_plugin(
                 'ai_rename',
