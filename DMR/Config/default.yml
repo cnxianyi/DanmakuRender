@@ -57,7 +57,8 @@ ai_rename_args:
     notify_errors: true
     notification_cooldown: 300
   screenshot_image_format: jpg
-  screenshot_max_width: 1280
+  # 0 表示保持视频首帧原始分辨率，不进行缩放
+  screenshot_max_width: 0
   screenshot_jpeg_quality: 3
   screenshot_timeout: 30
   # 开启后直接使用 game；不会自动识别，直播结束时仍可发送人工查看首帧截图

@@ -179,6 +179,10 @@ ai_rename_args:
     # 可选本地代理：http://127.0.0.1:7890 或 socks5h://127.0.0.1:1080
     # proxy: 'http://127.0.0.1:7890'
     reply_window: 86400
+  # 截图默认保持视频首帧原始分辨率；设置为正数时才限制最大宽度
+  screenshot_image_format: jpg
+  screenshot_max_width: 0
+  screenshot_jpeg_quality: 3
   # 开启后先用固定游戏名修改一次；Telegram 回复后再覆盖
   fixed_game: false
   game: '三角洲行动'

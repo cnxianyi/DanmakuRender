@@ -39,7 +39,8 @@ ai_rename_args:
   model: gpt-5.6-luna
   frame_positions: [0.33, 0.66, 0.99]
   image_format: jpg
-  max_image_width: 1280
+  # 兼容旧字段；0 表示保持首帧原始分辨率
+  max_image_width: 0
   image_detail: low
   timeout: 60
   retries: 2
@@ -67,7 +68,8 @@ ai_rename_args:
     notify_errors: true
     notification_cooldown: 300
   screenshot_image_format: jpg
-  screenshot_max_width: 1280
+  # 0 表示保持视频首帧原始分辨率，不进行缩放
+  screenshot_max_width: 0
   screenshot_jpeg_quality: 3
   # 截取视频首帧的超时时间（秒）
   screenshot_timeout: 30

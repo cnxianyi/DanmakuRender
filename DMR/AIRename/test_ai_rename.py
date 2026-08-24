@@ -210,6 +210,7 @@ class ScreenshotTests(unittest.TestCase):
             try:
                 command = run.call_args.args[0]
                 self.assertNotIn('-ss', command)
+                self.assertNotIn('-vf', command)
                 self.assertEqual(command[command.index('-i') + 1], source)
                 self.assertEqual(command[command.index('-frames:v') + 1], '1')
             finally:

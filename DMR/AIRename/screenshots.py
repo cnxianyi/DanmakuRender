@@ -17,7 +17,7 @@ def extract_first_frame(video, config=None):
         raise ValueError(f'不支持的截图格式: {image_format}')
 
     max_width = max(0, int(
-        config.get('screenshot_max_width', config.get('max_image_width', 1280))
+        config.get('screenshot_max_width', config.get('max_image_width', 0))
     ))
     timeout = max(1, float(config.get('screenshot_timeout', 30)))
     frame_path = get_tempfile(prefix='tg-screenshot', suffix=image_format)
