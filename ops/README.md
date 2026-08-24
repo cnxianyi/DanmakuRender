@@ -1,12 +1,12 @@
-# Windows 进程守护与 Bark 通知
+# Windows 进程守护与 Telegram 通知
 
 本目录中的脚本运行在 DanmakuRender 外部，不修改 Python 业务代码或直播任务 YAML 配置。
 
 守护脚本提供以下功能：
 
 - DanmakuRender 退出后自动重启。
-- 发现 `ERROR`、`CRITICAL` 或 Python traceback 时发送 Bark 通知。
-- 检测到直播开始和直播结束时发送 Bark 通知。
+- 发现 `ERROR`、`CRITICAL` 或 Python traceback 时发送 Telegram 通知。
+- 检测到直播开始和直播结束时发送 Telegram 通知。
 - 对重复的开播日志进行去重，避免录制重试时反复通知。
 - 通过 Windows 计划任务在用户登录后自动启动。
 
@@ -30,21 +30,25 @@ Copy-Item .\ops\watchdog.local.example.psd1 .\ops\watchdog.local.psd1
 python -c "import sys; print(sys.executable)"
 ```
 
-编辑 `ops\watchdog.local.psd1`，设置 Python 和 Bark：
+编辑 `ops\watchdog.local.psd1`，设置 Python 和 Telegram：
 
 ```powershell
 @{
     PythonCommand = 'C:\Users\thefa\AppData\Local\Microsoft\WindowsApps\python.exe'
-    BarkUrl = 'https://api.day.app/你的设备Key'
+    TelegramBotToken = '123456:ABCDEF'
+    TelegramChatId = '7129142702'
+    TelegramApiBase = 'https://api.telegram.org'
+    TelegramProxy = ''
+    TelegramMessageThreadId = ''
     PythonArguments = @('main.py', '--skip_update')
     NotificationCooldownSeconds = 300
     ErrorPattern = '\[(ERROR|CRITICAL)\]|Traceback \(most recent call last\):|Unhandled exception|Fatal Python error'
 }
 ```
 
-`watchdog.local.psd1` 包含 Bark Key，已经通过 `.gitignore` 排除，不会被 Git 跟踪。
+`watchdog.local.psd1` 包含 Telegram Bot Token，已经通过 `.gitignore` 排除，不会被 Git 跟踪。
 
-## 测试 Bark
+## 测试 Telegram
 
 只发送测试通知，不启动 DanmakuRender：
 
@@ -152,4 +156,4 @@ Get-ChildItem .\logs -File |
 
 任务名会根据日志自动替换为 `kami`、`oyo` 或其他任务名。程序启动时直播间本来就是离线状态，不会误发直播结束通知。
 
-守护生命周期和 Bark 请求失败记录在 `ops\watchdog.log`；DanmakuRender 自身日志继续写入 `logs\`。
+守护生命周期和 Telegram 请求失败记录在 `ops\watchdog.log`；DanmakuRender 自身日志继续写入 `logs\`。

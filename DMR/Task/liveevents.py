@@ -14,6 +14,8 @@ class LiveEvents(BaseEvents):
         self.upload_request_dict = {}
         self.bv_title_dict = {}
         self.bv_manual_game_dict = {}
+        self.bv_pending_manual_game_dict = {}
+        self.telegram_screenshot_dict = {}
         self.logger = logging.getLogger(__name__)
 
     @property
@@ -29,11 +31,13 @@ class LiveEvents(BaseEvents):
             'render/error': self.defaultEvent,
             'ai_rename/end': self.onAIRenameEnd,
             'ai_rename/error': self.onAIRenameError,
+            'ai_rename/screenshots_end': self.onTelegramScreenshotsEnd,
+            'ai_rename/screenshots_error': self.onTelegramScreenshotsEnd,
             'ai_rename/telegram_update': self.onTelegramUpdate,
             'uploader/end': self.onUploadEnd,
             'uploader/error': self.defaultEvent,
-            'uploader/title/end': self.defaultEvent,
-            'uploader/title/error': self.defaultEvent,
+            'uploader/title/end': self.onBVTitleEnd,
+            'uploader/title/error': self.onBVTitleError,
             'cleaner/end': self.defaultEvent,
             'cleaner/error': self.defaultEvent,
             'default': self.defaultEvent,
@@ -79,9 +83,6 @@ class LiveEvents(BaseEvents):
         if self.config['common_event_args'].get('ai_rename'):
             ai_args = self.config.get('ai_rename_args', {})
             fixed_result = fixed_game_result(ai_args)
-            tg_config = ai_args.get('tg')
-            tg_enabled = bool(tg_config) if isinstance(tg_config, str) \
-                else bool((tg_config or {}).get('enabled'))
             if fixed_result is not None:
                 ai_state.update({'status': 'ready', **fixed_result})
                 if ai_state['main_game']:
@@ -89,26 +90,9 @@ class LiveEvents(BaseEvents):
                 else:
                     self.logger.warning(f'{self.name}: fixed_game 已开启，但 game 为空或被过滤.')
             else:
-                # Automatic screenshot/vision recognition has been removed.
-                # Without a fixed game, the segment continues without a game name.
+                # Automatic game recognition has been removed. Screenshots are
+                # collected once at live end for human review in Telegram.
                 ai_state['status'] = 'ready'
-            if tg_enabled:
-                ai_request_id = uuid()
-                ai_state['request_id'] = ai_request_id
-                ret_msgs.append(PipeMessage(
-                    source=self.name,
-                    target='ai_rename',
-                    event='newtask',
-                    request_id=ai_request_id,
-                    data={
-                        'taskname': self.name,
-                        'video': video,
-                        'args': {
-                            **ai_args,
-                            '_fixed_result': fixed_result,
-                        },
-                    },
-                ))
         self.ai_rename_dict.setdefault(video.group_id, []).append(ai_state)
 
         if self.config['common_event_args'].get('auto_transcode'):
@@ -194,6 +178,7 @@ class LiveEvents(BaseEvents):
             self.logger.debug(f'No such group:{group_id}.')
         
         ret_msgs = []
+        ret_msgs += self._queue_telegram_screenshots(group_id)
         if self.config['common_event_args'].get('auto_upload'):
             upload_msgs = self._check_for_upload(group_id)
             ret_msgs += upload_msgs
@@ -203,6 +188,53 @@ class LiveEvents(BaseEvents):
         self._free_state_memory()
         
         return ret_msgs
+
+    def _queue_telegram_screenshots(self, group_id):
+        if not self.config['common_event_args'].get('ai_rename'):
+            return []
+        args = self.config.get('ai_rename_args', {})
+        tg_config = args.get('tg')
+        tg_enabled = bool(tg_config) if isinstance(tg_config, str) \
+            else bool((tg_config or {}).get('enabled'))
+        if not tg_enabled or group_id not in self.state_dict:
+            return []
+        if group_id in self.telegram_screenshot_dict:
+            return []
+
+        videos = []
+        for video_state in self.state_dict[group_id]:
+            # Use the original segment so screenshots do not wait for rendering
+            # or upload and remain available until the Telegram task finishes.
+            video = None
+            for vtype in ('src_video_pre', 'src_video', 'dm_video'):
+                candidate = video_state.get(vtype, {}).get('file')
+                if candidate and getattr(candidate, 'path', None):
+                    video = candidate
+                    break
+            if video is not None:
+                videos.append(video)
+
+        if not videos:
+            self.logger.warning(f'{self.name}: 直播组 {group_id} 没有可截图的视频.')
+            return []
+
+        request_id = uuid()
+        self.telegram_screenshot_dict[group_id] = {
+            'request_id': request_id,
+            'pending': True,
+        }
+        return [PipeMessage(
+            source=self.name,
+            target='ai_rename',
+            event='newtask',
+            request_id=request_id,
+            data={
+                'taskname': self.name,
+                'group_id': group_id,
+                'videos': videos,
+                'args': dict(args),
+            },
+        )]
     
     def _check_for_upload(self, group_id:str, _idx:int=None):
         ret_msgs = []
@@ -365,19 +397,83 @@ class LiveEvents(BaseEvents):
         if not state:
             return []
 
+        queued = state.setdefault('queued', {})
+        if isinstance(queued, set):
+            # Compatibility with state created before manual overrides were added.
+            queued = state['queued'] = {}
+        fixed_queued = state.setdefault('fixed_queued', set())
+        fixed_applied = state.setdefault('fixed_applied', set())
+        fixed_failed = state.setdefault('fixed_failed', set())
+        for key in ('fixed_queued', 'fixed_applied', 'fixed_failed'):
+            if not isinstance(state[key], set):
+                state[key] = set(state[key] or [])
+        fixed_queued = state['fixed_queued']
+        fixed_applied = state['fixed_applied']
+        fixed_failed = state['fixed_failed']
+
+        uploads = [
+            upload for upload in state['uploads'].values()
+            if upload.get('bvid') and upload.get('engine') in ('biliuprs', 'biliwebapi')
+        ]
+        fixed_result = fixed_game_result(config)
+        fixed_required = bool(fixed_result and fixed_result.get('main_game'))
         ret_msgs = []
-        for upload in state['uploads'].values():
-            bvid = upload.get('bvid')
-            if not bvid:
-                continue
-            if upload.get('engine') not in ('biliuprs', 'biliwebapi'):
-                continue
-            manual_game = self.bv_manual_game_dict.get(group_id)
-            title_states = self.ai_rename_dict.get(group_id, [])
-            if manual_game:
-                # A Telegram reply is authoritative for the whole BV, rather than
-                # one more vote in the per-segment recognition statistics.
-                title_states = [{'games': [manual_game], 'main_game': manual_game}]
+
+        # A fixed game is a real first title phase. Manual replies are held until
+        # every eligible BV has completed this phase, so a quick Telegram reply
+        # cannot cancel the initial fixed title request.
+        if fixed_required:
+            for upload in uploads:
+                bvid = upload['bvid']
+                if bvid in fixed_applied or bvid in fixed_failed or bvid in fixed_queued:
+                    continue
+                title, games = build_bv_title(
+                    upload.get('title'),
+                    [fixed_result],
+                    config,
+                )
+                if not title:
+                    fixed_applied.add(bvid)
+                    continue
+                queued[bvid] = title
+                fixed_queued.add(bvid)
+                self.logger.info(f'视频组 {group_id} 固定游戏结果: {games}; 准备修改 {bvid} 标题.')
+                ret_msgs.append(PipeMessage(
+                    source=self.name,
+                    target='uploader',
+                    event='edit_bv_title',
+                    request_id=uuid(),
+                    data={
+                        'bvid': bvid,
+                        'title': title,
+                        'group_id': group_id,
+                        'phase': 'fixed',
+                        'args': upload.get('args') or {},
+                        'delay': config.get('bv_title_delay', 10),
+                        'retries': config.get('bv_title_retries', 2),
+                        'retry_interval': config.get('bv_title_retry_interval', 30),
+                    },
+                ))
+
+            if any(
+                upload['bvid'] not in fixed_applied and upload['bvid'] not in fixed_failed
+                for upload in uploads
+            ):
+                return ret_msgs
+
+        pending_game = self.bv_pending_manual_game_dict.get(group_id)
+        if pending_game:
+            self.bv_manual_game_dict[group_id] = pending_game
+
+        manual_game = self.bv_manual_game_dict.get(group_id)
+        title_states = self.ai_rename_dict.get(group_id, [])
+        if manual_game:
+            # A Telegram reply is authoritative for the whole BV, rather than
+            # one more vote in the per-segment recognition statistics.
+            title_states = [{'games': [manual_game], 'main_game': manual_game}]
+
+        for upload in uploads:
+            bvid = upload['bvid']
             title, games = build_bv_title(
                 upload.get('title'),
                 title_states,
@@ -386,10 +482,6 @@ class LiveEvents(BaseEvents):
             if not title:
                 self.logger.info(f'视频组 {group_id} 没有可用的游戏识别结果，不修改 {bvid} 标题.')
                 continue
-            queued = state.setdefault('queued', {})
-            if isinstance(queued, set):
-                # Compatibility with state created before manual overrides were added.
-                queued = state['queued'] = {}
             if queued.get(bvid) == title:
                 continue
             queued[bvid] = title
@@ -403,6 +495,8 @@ class LiveEvents(BaseEvents):
                 data={
                     'bvid': bvid,
                     'title': title,
+                    'group_id': group_id,
+                    'phase': 'manual' if manual_game else 'normal',
                     'args': upload.get('args') or {},
                     'delay': config.get('bv_title_delay', 10),
                     'retries': config.get('bv_title_retries', 2),
@@ -530,27 +624,100 @@ class LiveEvents(BaseEvents):
         if group_id is None:
             group_id = data.get('group_id')
         if group_id not in self.state_dict:
-            self.logger.info('Telegram /update 对应的视频状态已过期，已忽略.')
+            self.logger.info('Telegram 回复对应的视频状态已过期，已忽略.')
             return
 
         game = normalize_game(data.get('game', ''), self.config.get('ai_rename_args', {}))
         if not game:
-            self.logger.warning('Telegram /update 的游戏名为空或被过滤，已忽略.')
+            self.logger.warning('Telegram 回复的游戏名为空或被过滤，已忽略.')
             return
 
-        self.bv_manual_game_dict[group_id] = game
+        self.bv_pending_manual_game_dict[group_id] = game
         if ai_state is not None:
             ai_state['manual_game'] = game
+        fixed_result = fixed_game_result(self.config.get('ai_rename_args', {}))
+        title_state = self.bv_title_dict.get(group_id) or {}
+        fixed_done = not fixed_result or all(
+            upload.get('bvid') in set(title_state.get('fixed_applied') or []) | set(title_state.get('fixed_failed') or [])
+            for upload in title_state.get('uploads', {}).values()
+            if upload.get('bvid') and upload.get('engine') in ('biliuprs', 'biliwebapi')
+        ) and bool(title_state.get('uploads'))
+        if not fixed_done and fixed_result and self.config.get('ai_rename_args', {}).get('update_bv_title'):
+            self.logger.info(
+                f'{self.name}: 已记录 Telegram 游戏名【{game}】，等待固定标题阶段完成后覆盖视频组 {group_id}.'
+            )
+            return []
+
+        self.bv_manual_game_dict[group_id] = game
         self.logger.info(f'{self.name}: Telegram 人工覆盖视频组 {group_id} 的 BV 游戏前缀为【{game}】.')
 
         # Before upload completion this stores the override for the normal final edit;
         # after completion it queues another edit only when the target title changed.
         return self._check_for_bv_title(group_id)
+
+    def onTelegramScreenshotsEnd(self, message:PipeMessage):
+        data = message.data or {}
+        group_id = data.get('group_id')
+        if group_id is None:
+            for candidate_group, state in self.telegram_screenshot_dict.items():
+                if state.get('request_id') == message.request_id:
+                    group_id = candidate_group
+                    break
+        if group_id is None:
+            return
+        screenshot_state = self.telegram_screenshot_dict.get(group_id)
+        if screenshot_state and screenshot_state.get('request_id') != message.request_id:
+            return
+        if message.event == 'screenshots_error' or data.get('error'):
+            self.logger.warning(f'{self.name}: 直播组 {group_id} Telegram 截图任务失败: {message.msg}')
+        else:
+            self.logger.info(f'{self.name}: 直播组 {group_id} Telegram 截图任务已结束.')
+        self.telegram_screenshot_dict.pop(group_id, None)
+
+        ret_msgs = []
+        if self.config['common_event_args'].get('auto_clean'):
+            ret_msgs += self._check_for_clean(group_id)
+        self._free_state_memory()
+        return ret_msgs
+
+    def onBVTitleEnd(self, message:PipeMessage):
+        data = message.data or {}
+        group_id = data.get('group_id')
+        bvid = data.get('bvid')
+        phase = data.get('phase')
+        if not group_id or not bvid:
+            self.defaultEvent(message)
+            return
+        state = self.bv_title_dict.get(group_id)
+        if state and phase == 'fixed':
+            state.setdefault('fixed_queued', set()).discard(bvid)
+            state.setdefault('fixed_applied', set()).add(bvid)
+        return self._check_for_bv_title(group_id)
+
+    def onBVTitleError(self, message:PipeMessage):
+        data = message.data or {}
+        group_id = data.get('group_id')
+        bvid = data.get('bvid')
+        phase = data.get('phase')
+        if not group_id or not bvid:
+            self.defaultEvent(message)
+            return
+        state = self.bv_title_dict.get(group_id)
+        if state and phase == 'fixed':
+            state.setdefault('fixed_queued', set()).discard(bvid)
+            # Let a manual answer proceed even if the initial fixed update failed.
+            state.setdefault('fixed_failed', set()).add(bvid)
+        self.logger.warning(f'{self.name}: 视频组 {group_id} 的 BV {bvid} 标题修改失败，阶段: {phase}.')
+        return self._check_for_bv_title(group_id)
     
     def _check_for_clean(self, group_id=None):
         ret_msgs = []
         clean_args = self.config['clean_args']
-        for group_id, video_states in self.state_dict.items():
+        for current_group_id, video_states in self.state_dict.items():
+            if group_id is not None and current_group_id != group_id:
+                continue
+            if self.telegram_screenshot_dict.get(current_group_id, {}).get('pending'):
+                continue
             for idx, video_state in enumerate(video_states):
                 for vtype, info in video_state.items():
                     if info['status'] != 'uploaded':
@@ -563,11 +730,11 @@ class LiveEvents(BaseEvents):
                                 # 判断是否需要清理源文件
                                 if vtype == 'dm_video' and arg.get('w_srcfile', False) == True and video_state['src_video']['file'] is not None:
                                     files.append(video_state['src_video']['file'])
-                                    self.state_dict[group_id][idx]['src_video']['status'] = 'cleaned'
+                                    self.state_dict[current_group_id][idx]['src_video']['status'] = 'cleaned'
                                 # 判断是否需要清理源文件（转码前）
                                 if vtype == 'src_video' and arg.get('w_srcpre', True) == True and video_state['src_video_pre']['file'] is not None:
                                     files.append(video_state['src_video_pre']['file'])
-                                    self.state_dict[group_id][idx]['src_video_pre']['status'] = 'cleaned'
+                                    self.state_dict[current_group_id][idx]['src_video_pre']['status'] = 'cleaned'
                                 
                                 clean_msg = PipeMessage(
                                     source=self.name,
@@ -583,7 +750,7 @@ class LiveEvents(BaseEvents):
                                     }
                                 )
                                 ret_msgs.append(clean_msg)
-                    self.state_dict[group_id][idx][vtype]['status'] = 'cleaned'
+                    self.state_dict[current_group_id][idx][vtype]['status'] = 'cleaned'
 
         return ret_msgs
     
@@ -605,13 +772,15 @@ class LiveEvents(BaseEvents):
             if need_free and self.config['common_event_args'].get('ai_rename'):
                 if any(state['status'] == 'recognizing' for state in self.ai_rename_dict.get(group_id, [])):
                     need_free = False
+            if self.telegram_screenshot_dict.get(group_id, {}).get('pending'):
+                need_free = False
             tg_config = self.config.get('ai_rename_args', {}).get('tg') or {}
             if isinstance(tg_config, str):
                 tg_config = {'enabled': True}
             reply_window = max(0, float(tg_config.get('reply_window', 86400)))
             if need_free and self.config.get('ai_rename_args', {}).get('update_bv_title') and tg_config.get('enabled') and reply_window and \
                     time.time() - self.ended_dict[group_id] < reply_window:
-                # Keep only lightweight state long enough to accept a late /update.
+                # Keep only lightweight state long enough to accept a late Telegram reply.
                 need_free = False
             if need_free:
                 self.logger.debug(f'视频组{group_id}处理完成，视频信息已被释放.')
@@ -620,6 +789,8 @@ class LiveEvents(BaseEvents):
                 self.ai_rename_dict.pop(group_id, None)
                 self.bv_title_dict.pop(group_id, None)
                 self.bv_manual_game_dict.pop(group_id, None)
+                self.bv_pending_manual_game_dict.pop(group_id, None)
+                self.telegram_screenshot_dict.pop(group_id, None)
                 self.upload_request_dict = {
                     request_id: upload
                     for request_id, upload in self.upload_request_dict.items()
@@ -639,6 +810,8 @@ class LiveEvents(BaseEvents):
                 self.ai_rename_dict.pop(group_id, None)
                 self.bv_title_dict.pop(group_id, None)
                 self.bv_manual_game_dict.pop(group_id, None)
+                self.bv_pending_manual_game_dict.pop(group_id, None)
+                self.telegram_screenshot_dict.pop(group_id, None)
                 self.upload_request_dict = {
                     request_id: upload
                     for request_id, upload in self.upload_request_dict.items()
@@ -657,7 +830,13 @@ class LiveEvents(BaseEvents):
                 'engine': data.get('engine') or upload.get('engine'),
                 'upload_group': data.get('upload_group') or upload.get('upload_group'),
             })
-            title_state = self.bv_title_dict.setdefault(group_id, {'uploads': {}, 'queued': {}})
+            title_state = self.bv_title_dict.setdefault(group_id, {
+                'uploads': {},
+                'queued': {},
+                'fixed_queued': set(),
+                'fixed_applied': set(),
+                'fixed_failed': set(),
+            })
             existing_upload = title_state['uploads'].get(upload['upload_group'])
             if existing_upload:
                 # A realtime BV is created by the first segment. Keep that segment's
@@ -697,6 +876,8 @@ class LiveEvents(BaseEvents):
         self.upload_request_dict.clear()
         self.bv_title_dict.clear()
         self.bv_manual_game_dict.clear()
+        self.bv_pending_manual_game_dict.clear()
+        self.telegram_screenshot_dict.clear()
         return PipeMessage(
             source=self.name,
             target='downloader',

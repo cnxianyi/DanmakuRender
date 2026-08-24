@@ -2,7 +2,11 @@
 param(
     [string]$ConfigFile,
     [string]$PythonCommand,
-    [string]$BarkUrl,
+    [string]$TelegramBotToken,
+    [string]$TelegramChatId,
+    [string]$TelegramApiBase,
+    [string]$TelegramProxy,
+    [string]$TelegramMessageThreadId,
     [int]$MaxRestarts = 0,
     [switch]$TestNotification
 )
@@ -18,8 +22,15 @@ if (Test-Path -LiteralPath $ConfigFile) {
 
 if (-not $PythonCommand) { $PythonCommand = $settings.PythonCommand }
 if (-not $PythonCommand) { $PythonCommand = 'python' }
-if (-not $BarkUrl) { $BarkUrl = $settings.BarkUrl }
-if (-not $BarkUrl) { $BarkUrl = $env:DMR_BARK_URL }
+if (-not $TelegramBotToken) { $TelegramBotToken = $settings.TelegramBotToken }
+if (-not $TelegramBotToken) { $TelegramBotToken = $env:DMR_TG_BOT_TOKEN }
+if (-not $TelegramChatId) { $TelegramChatId = $settings.TelegramChatId }
+if (-not $TelegramChatId) { $TelegramChatId = $env:DMR_TG_CHAT_ID }
+if (-not $TelegramApiBase) { $TelegramApiBase = $settings.TelegramApiBase }
+if (-not $TelegramApiBase) { $TelegramApiBase = 'https://api.telegram.org' }
+if (-not $TelegramProxy) { $TelegramProxy = $settings.TelegramProxy }
+if (-not $TelegramProxy) { $TelegramProxy = $env:DMR_TG_PROXY }
+if (-not $TelegramMessageThreadId) { $TelegramMessageThreadId = $settings.TelegramMessageThreadId }
 if (-not $MaxRestarts -and $settings.MaxRestarts) { $MaxRestarts = [int]$settings.MaxRestarts }
 
 $pythonArguments = @('main.py', '--skip_update')
@@ -51,14 +62,14 @@ function Write-WatchdogLog {
     Add-Content -LiteralPath $watchdogLog -Value $line -Encoding UTF8
 }
 
-function Send-BarkNotification {
+function Send-TelegramNotification {
     param(
         [string]$Title,
         [string]$Body,
         [string]$CooldownKey = 'general'
     )
 
-    if (-not $BarkUrl) { return $false }
+    if (-not $TelegramBotToken -or -not $TelegramChatId) { return $false }
     $now = Get-Date
     if ($script:notificationTimes.ContainsKey($CooldownKey) -and
         ($now - $script:notificationTimes[$CooldownKey]).TotalSeconds -lt $cooldownSeconds) {
@@ -67,26 +78,34 @@ function Send-BarkNotification {
 
     try {
         $payload = @{
-            title = $Title
-            body = $Body
-            group = 'DanmakuRender'
-            level = 'timeSensitive'
-        } | ConvertTo-Json
-        Invoke-RestMethod -Method Post -Uri $BarkUrl.TrimEnd('/') -ContentType 'application/json; charset=utf-8' -Body $payload -TimeoutSec 15 | Out-Null
+            chat_id = $TelegramChatId
+            text = "$Title`n$Body"
+        }
+        if ($TelegramMessageThreadId) { $payload.message_thread_id = $TelegramMessageThreadId }
+        $request = @{
+            Method = 'Post'
+            Uri = "{0}/bot{1}/sendMessage" -f $TelegramApiBase.TrimEnd('/'), $TelegramBotToken
+            Body = $payload
+            ContentType = 'application/x-www-form-urlencoded'
+            TimeoutSec = 60
+        }
+        if ($TelegramProxy) { $request.Proxy = $TelegramProxy }
+        $response = Invoke-RestMethod @request
+        if (-not $response.ok) { throw [Exception]($response.description) }
         $script:notificationTimes[$CooldownKey] = $now
         return $true
     }
     catch {
-        Write-WatchdogLog "Bark notification failed: $($_.Exception.Message)"
+        Write-WatchdogLog "Telegram notification failed: $($_.Exception.Message)"
         return $false
     }
 }
 
 if ($TestNotification) {
-    if (-not $BarkUrl) { throw 'BarkUrl is empty. Set it in watchdog.local.psd1 first.' }
-    $sent = Send-BarkNotification -Title "DanmakuRender test on $machineName" -Body 'The Windows watchdog can reach Bark.' -CooldownKey 'test'
-    if (-not $sent) { throw 'Bark test notification failed. See ops\watchdog.log for details.' }
-    Write-WatchdogLog 'Bark test notification sent.'
+    if (-not $TelegramBotToken -or -not $TelegramChatId) { throw 'TelegramBotToken and TelegramChatId must be set in watchdog.local.psd1 first.' }
+    $sent = Send-TelegramNotification -Title "DanmakuRender test on $machineName" -Body 'The Windows watchdog can reach Telegram.' -CooldownKey 'test'
+    if (-not $sent) { throw 'Telegram test notification failed. See ops\watchdog.log for details.' }
+    Write-WatchdogLog 'Telegram test notification sent.'
     return
 }
 
@@ -125,7 +144,7 @@ try {
                     if ($wasLive) {
                         $endCooldownKey = "live-end:$taskName"
                         $script:notificationTimes.Remove($endCooldownKey) | Out-Null
-                        Send-BarkNotification -Title $liveEndedTitle -Body $taskName -CooldownKey $endCooldownKey | Out-Null
+                        Send-TelegramNotification -Title $liveEndedTitle -Body $taskName -CooldownKey $endCooldownKey | Out-Null
                     }
                 }
                 elseif ($line -match $liveStartPattern) {
@@ -134,14 +153,14 @@ try {
                         $script:liveTasks[$taskName] = $true
                         $startCooldownKey = "live-start:$taskName"
                         $script:notificationTimes.Remove($startCooldownKey) | Out-Null
-                        Send-BarkNotification -Title $liveStartedTitle -Body $taskName -CooldownKey $startCooldownKey | Out-Null
+                        Send-TelegramNotification -Title $liveStartedTitle -Body $taskName -CooldownKey $startCooldownKey | Out-Null
                         Write-WatchdogLog "Live-start event detected: $taskName"
                     }
                 }
 
                 if ($line -match $errorPattern) {
                     $shortLine = if ($line.Length -gt 800) { $line.Substring(0, 800) + '...' } else { $line }
-                    Send-BarkNotification -Title "DanmakuRender error on $machineName" -Body $shortLine -CooldownKey 'error' | Out-Null
+                    Send-TelegramNotification -Title "DanmakuRender error on $machineName" -Body $shortLine -CooldownKey 'error' | Out-Null
                 }
             }
             $exitCode = $LASTEXITCODE
@@ -149,7 +168,7 @@ try {
         catch {
             $startError = $_.Exception.Message
             Write-WatchdogLog "Failed to run DanmakuRender: $startError"
-            Send-BarkNotification -Title "DanmakuRender failed on $machineName" -Body $startError -CooldownKey 'error' | Out-Null
+            Send-TelegramNotification -Title "DanmakuRender failed on $machineName" -Body $startError -CooldownKey 'error' | Out-Null
         }
         finally {
             $ErrorActionPreference = $previousErrorActionPreference
@@ -158,7 +177,7 @@ try {
         $restartCount++
         $runSeconds = [int]((Get-Date) - $startedAt).TotalSeconds
         Write-WatchdogLog "DanmakuRender exited with code $exitCode after ${runSeconds}s."
-        Send-BarkNotification -Title "DanmakuRender stopped on $machineName" -Body "Exit code: $exitCode`nRuntime: ${runSeconds}s`nThe watchdog will restart it." -CooldownKey 'error' | Out-Null
+        Send-TelegramNotification -Title "DanmakuRender stopped on $machineName" -Body "Exit code: $exitCode`nRuntime: ${runSeconds}s`nThe watchdog will restart it." -CooldownKey 'error' | Out-Null
 
         if ($MaxRestarts -gt 0 -and $restartCount -ge $MaxRestarts) {
             Write-WatchdogLog "Maximum restart count ($MaxRestarts) reached; watchdog exiting."

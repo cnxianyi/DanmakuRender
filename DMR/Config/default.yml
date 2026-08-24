@@ -23,12 +23,12 @@ downloader_kernel_args:
 
 # 游戏名处理核心参数
 ai_rename_kernel_args:
-  # 同时处理的 Telegram 通知任务数
+  # 同时处理的 Telegram 截图任务数
   nworkers: 1
 
 # 游戏名处理与重命名默认参数
 ai_rename_args:
-  # 可选：发送 Telegram 文本消息，回复 /update 游戏名可人工指定游戏
+  # 直播结束后，为每个分段截取首帧并发送到 Telegram
   # 也支持简写：tg: '123456:ABCDEF'；此时会从机器人最近更新自动发现 chat_id
   tg:
     enabled: false
@@ -38,17 +38,29 @@ ai_rename_args:
     chat_id: ~
     # 话题群的 topic ID，普通聊天留空
     message_thread_id: ~
-    caption: "{TASKNAME} | 分段 {SEGMENT_ID} | {GAME}\n回复本消息：/update 游戏名"
+    caption: "{TASKNAME} | 直播结束 | {COUNT} 个视频\n截图顺序：{SEGMENTS}\n{GAME_LINE}\n{UPDATE_HINT}"
     disable_notification: false
     api_base: https://api.telegram.org
+    # 可选本地代理，例如 http://127.0.0.1:7890 或 socks5h://127.0.0.1:1080
+    # 使用 SOCKS5 代理时需要安装 PySocks
+    proxy: ~
     timeout: 60
-    # 接收 /update 回复的长轮询时长，以及回复保持有效的秒数
+    # 接收图片回复的长轮询时长，以及回复保持有效的秒数
     poll_timeout: 20
     poll_retry_interval: 5
     reply_window: 86400
     retries: 2
     retry_interval: 2
-  # 开启后直接使用 game；不会截图或请求 AI
+    # Python 运行通知复用本 Telegram 配置
+    notify_live_start: true
+    notify_live_end: true
+    notify_errors: true
+    notification_cooldown: 300
+  screenshot_image_format: jpg
+  screenshot_max_width: 1280
+  screenshot_jpeg_quality: 3
+  screenshot_timeout: 30
+  # 开启后直接使用 game；不会自动识别，直播结束时仍可发送人工查看首帧截图
   fixed_game: false
   game: ''
   # rename_files 开启时默认只重命名弹幕版；不渲染弹幕版时可改为 [src_video]
@@ -59,7 +71,7 @@ ai_rename_args:
   existing_prefix_pattern: '^【[^】]+】'
   max_game_name_length: 10
   excluded_names: []
-  # 整场直播上传完成后，按各分段的游戏名修改 BV 标题
+  # 先按固定游戏名修改一次，之后可用 Telegram 回复覆盖标题
   update_bv_title: false
   bv_title_count_source: games
   bv_title_template: '【{GAMES}】{TITLE}'

@@ -239,7 +239,13 @@ class Uploader():
                 target=message.source,
                 request_id=message.request_id,
                 dtype='dict',
-                data={'bvid': bvid, 'title': title, 'changed': changed},
+                data={
+                    'bvid': bvid,
+                    'title': title,
+                    'changed': changed,
+                    'group_id': config.get('group_id'),
+                    'phase': config.get('phase'),
+                },
             )
         except Exception as e:
             self.logger.exception(e)
@@ -249,7 +255,13 @@ class Uploader():
                 target=message.source,
                 request_id=message.request_id,
                 dtype=str(type(e)),
-                data={'bvid': bvid, 'title': title, 'error': str(e)},
+                data={
+                    'bvid': bvid,
+                    'title': title,
+                    'error': str(e),
+                    'group_id': config.get('group_id'),
+                    'phase': config.get('phase'),
+                },
             )
         finally:
             with self._lock:

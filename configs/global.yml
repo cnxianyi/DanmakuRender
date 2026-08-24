@@ -13,9 +13,87 @@ dmr_engine_args:
   # 选择组件
   # 可选组件： downloader（下载器）, render（渲染器）, uploader（上传器）, cleaner（清理器），webservice（WebUI服务，默认不启用）
   enabled_plugins: ['downloader', 'render', 'uploader', 'cleaner']
+  # 是否动态更新配置文件
+  dynamic_config: True
+  # 动态更新的配置文件路径
+  dynamic_config_path: ./configs
   # 配置文件路径
   # 可设置为文件/文件夹列表
   config_path: ./configs
+
+# 下载器核心参数
+downloader_kernel_args:
+  test: ~
+
+# AI 视频识别核心参数；仅当任务开启 ai_rename 时才会加载
+ai_rename_kernel_args:
+  nworkers: 1
+
+# AI 视频识别与重命名参数
+ai_rename_args:
+  # OpenAI Chat Completions 兼容接口
+  endpoint: ~
+  # API Key 不放在全局配置中，由各 DMR-*.yml 任务配置提供
+  api_key_file: ~
+  # 填写支持图片输入的模型名称
+  model: gpt-5.6-luna
+  frame_positions: [0.33, 0.66, 0.99]
+  image_format: jpg
+  max_image_width: 1280
+  image_detail: low
+  timeout: 60
+  retries: 2
+  response_format: true
+  # Telegram 通知与首帧截图配置；bot_token、chat_id、proxy 等敏感值留空，
+  # 由各 DMR-*.yml 任务配置覆盖。chat_id 留空时可从机器人最近收到的消息中自动发现。
+  tg:
+    enabled: false
+    bot_token: ~
+    chat_id: ~
+    message_thread_id: ~
+    caption: "{TASKNAME} | 直播结束 | {COUNT} 个视频\n截图顺序：{SEGMENTS}\n{GAME_LINE}\n{UPDATE_HINT}"
+    disable_notification: false
+    api_base: https://api.telegram.org
+    proxy: ~
+    timeout: 60
+    poll_timeout: 20
+    poll_retry_interval: 5
+    reply_window: 86400
+    retries: 2
+    retry_interval: 2
+    # Python 运行通知复用本 Telegram 配置
+    notify_live_start: true
+    notify_live_end: true
+    notify_errors: true
+    notification_cooldown: 300
+  screenshot_image_format: jpg
+  screenshot_max_width: 1280
+  screenshot_jpeg_quality: 3
+  # 截取视频首帧的超时时间（秒）
+  screenshot_timeout: 30
+  # 开启后直接使用 game；不会自动识别，直播结束时仍可发送人工查看首帧截图
+  fixed_game: false
+  game: '三角洲行动'
+  # rename_files 开启时默认只重命名弹幕版；不渲染弹幕版时可改为 [src_video]
+  target_types: [dm_video]
+  rename_template: '【{GAME}】{BASENAME}'
+  rename_files: false
+  # 已有方括号前缀时不重复添加
+  existing_prefix_pattern: '^【[^】]+】'
+  max_game_name_length: 10
+  excluded_names: []
+  cache: true
+  # 先按固定游戏名修改一次，之后可用 Telegram 回复覆盖标题
+  update_bv_title: true
+  bv_title_count_source: games
+  bv_title_template: '【{GAMES}】{TITLE}'
+  bv_title_separator: '|'
+  bv_title_min_count: 1
+  bv_title_max_games: 2
+  bv_title_max_length: 80
+  bv_title_delay: 10
+  bv_title_retries: 2
+  bv_title_retry_interval: 30
 
 # 默认下载参数
 download_args:
@@ -170,6 +248,8 @@ download_args:
       superchat: ~
       gift: ~
       entry: ~
+      # ASS文本模板，使用方法请参考文档
+      ass_text: ~
     # 高级弹幕录制参数
     # 请确保你明白这些参数的含义后再修改
     advanced_dm_args:
@@ -296,11 +376,11 @@ render_args:
     # 生成的视频文件格式，默认mp4
     format: mp4
     # 硬件解码参数：针对 Linux 下的 AMD 核显，指定 vaapi 硬件加速
-    hwaccel_args: [-hwaccel,auto]
+    hwaccel_args: [-vaapi_device,/dev/dri/renderD128]
     # 编码器：Linux 系统下 AMD 显卡使用 h264_vaapi
-    vencoder: h264_amf
+    vencoder: h264_vaapi
     # 编码参数：设置码率为 15M，并指定 VAAPI 必要的像素格式转换滤镜
-    vencoder_args: [-global_quality, 20]
+    vencoder_args: [-global_quality, 25]
     # 音频编码器
     aencoder: aac
     # 音频编码器参数，默认恒定码率320Kbps
@@ -313,7 +393,7 @@ render_args:
     advanced_render_args:
       # 直接定义video filter，这里的{DANMAKU}代表弹幕文件路径
       # 注意设置filter_complex之后将会禁用fps等其他有关filter的选项
-      filter_complex: subtitles=filename='{DANMAKU}'
+      filter_complex: subtitles=filename='{DANMAKU}',format=nv12,hwupload
   # 原视频转码
   transcode:
     # 渲染输出文件夹，默认为在录制输出文件夹后面加上“转码后”
@@ -323,12 +403,12 @@ render_args:
     # 生成的视频文件格式，默认mp4
     format: mp4
     # 硬件解码参数，默认由FFmpeg自动判断，如果出现问题可以设为空
-    hwaccel_args: []
+    hwaccel_args: [-vaapi_device,/dev/dri/renderD128]
     # 视频编码器，NVIDIA设置为h264_nvenc，AMD设置为h264_amf，Apple用户设置为h264_videotoolbox，CPU设置为libx264
-    vencoder: h264_amf # h264_videotoolbox libx264
+    vencoder: h264_vaapi # h264_videotoolbox libx264
     # 视频编码器参数，默认恒定码率15Mbps
     #vencoder_args: [-b:v, 15M]
-    vencoder_args: [-global_quality, 20]
+    vencoder_args: [-global_quality, 23]
     # 音频编码器
     aencoder: aac
     # 音频编码器参数，默认恒定码率320Kbps
@@ -338,7 +418,8 @@ render_args:
     output_resize: ~
     # 高级渲染参数
     # 请确保你明白这些参数的含义后再修改
-    advanced_render_args: ~
+    advanced_render_args:
+      filter_complex: format=nv12,hwupload
   # 自定义ffmpeg调用（暂不可用）
   rawffmpeg:
     # 输出文件类型，可选src_video或者dm_video
@@ -361,7 +442,9 @@ upload_args:
     # 上传账号名称，程序依靠这个来识别不同的账号，如果打算传不同账号就要设置不同的名称
     account: bilibili
     # 上传cookies路径，如果设置为空将会保存到./login_info/{ACCOUNT}.json
-    cookies: C:\Users\thefa\Videos\DanmakuRender\tools\cookies.json 
+    cookies: /srv/s500/projects/DanmakuRender/tools/cookies.json
+    # 任务级上传锁，保证同一个任务中的上传顺序
+    task_upload_lock: True
     # 重试次数，如果上传遇到错误将会重试，设置为0表示不重试
     # 注意：重试会整个视频重传，并且阻塞后面视频的上传，不应该设置太大
     # 同步上传无法重传
@@ -407,6 +490,8 @@ upload_args:
     dtime: 0
     # 允许转载? 0-允许转载，1-禁止转载
     no_reprint: 1
+    # 是否开启充电? 0-关闭 1-开启
+    open_elec: 1
     # 额外参数列表（仅biliuprs生效）
     # 此参数将直接传入biliup-rs
     extra_args: ~
@@ -513,6 +598,10 @@ upload_args:
     # 上传命令行参数，可以使用关键字替换
     # 为保证安全调用，请使用参数列表的形式，例如：['python', 'upload.py', '{PATH}']
     command: ~
+
+# 清理器核心参数
+cleaner_kernel_args:
+  test: True
 
 # 清理器默认参数
 clean_args:

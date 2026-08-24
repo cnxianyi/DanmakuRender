@@ -8,6 +8,7 @@ import logging
 
 from .engine import DMREngine
 from .Config import Config
+from .notifications import TelegramNotifier
 from .utils import filename_to_taskname
 
 
@@ -15,7 +16,7 @@ def _redact_sensitive_config(value):
     if isinstance(value, dict):
         return {
             key: '***' if item and (
-                str(key).lower() in ('api_key', 'bot_token', 'token')
+                str(key).lower() in ('api_key', 'bot_token', 'token', 'proxy')
                 or (str(key).lower() == 'tg' and isinstance(item, str))
             )
             else _redact_sensitive_config(item)
@@ -26,6 +27,26 @@ def _redact_sensitive_config(value):
     return value
 
 
+def _telegram_notification_config(config):
+    """Use global Telegram settings, or the first enabled task override."""
+    global_args = config.get_config('ai_rename_args') or {}
+    global_tg = global_args.get('tg')
+    if isinstance(global_tg, str):
+        global_tg = {'enabled': True, 'bot_token': global_tg}
+    if isinstance(global_tg, dict) and global_tg.get('enabled'):
+        return global_tg
+
+    for taskname in config.get_replaytasks():
+        replay_config = config.get_replay_config(taskname) or {}
+        task_args = replay_config.get('ai_rename_args') or {}
+        task_tg = task_args.get('tg')
+        if isinstance(task_tg, str):
+            task_tg = {'enabled': True, 'bot_token': task_tg}
+        if isinstance(task_tg, dict) and task_tg.get('enabled'):
+            return task_tg
+    return global_tg if isinstance(global_tg, dict) else {}
+
+
 class DanmakuRender():
     def __init__(self, config:Config, **kwargs) -> None:
         self.logger = logging.getLogger('DMR')
@@ -33,7 +54,12 @@ class DanmakuRender():
         self.kwargs = kwargs
         self.stoped = True
         self.engine_args = self.config.get_config('dmr_engine_args')
-        self.engine = DMREngine()
+        self.telegram = TelegramNotifier(
+            _telegram_notification_config(self.config),
+            logger=self.logger,
+        )
+        self.telegram.install_logging_handler()
+        self.engine = DMREngine(self.telegram)
 
     def start(self):
         self.stoped = False
@@ -135,3 +161,5 @@ class DanmakuRender():
     def stop(self):
         self.stoped = True
         self.engine.stop()
+        self.telegram.process_stopped()
+        self.telegram.close()

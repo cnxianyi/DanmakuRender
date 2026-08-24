@@ -171,13 +171,15 @@ render_args:
 # 单独的游戏名处理设置（可选）
 # 未设置的字段会继承全局 ai_rename_args
 ai_rename_args:
-  # 将每个视频的游戏名确认消息发送到 Telegram
+  # 直播结束后将每个分段的首帧截图合并发送到 Telegram
   tg:
     enabled: false
     bot_token: '123456:ABCDEF'
     chat_id: '-1001234567890'
+    # 可选本地代理：http://127.0.0.1:7890 或 socks5h://127.0.0.1:1080
+    # proxy: 'http://127.0.0.1:7890'
     reply_window: 86400
-  # 开启后默认使用固定游戏名；Telegram 开启时仍可人工覆盖
+  # 开启后先用固定游戏名修改一次；Telegram 回复后再覆盖
   fixed_game: false
   game: '三角洲行动'
   # rename_files 开启时默认只重命名弹幕版；不渲染弹幕版时应设置为 [src_video]
@@ -187,7 +189,7 @@ ai_rename_args:
   # 单个游戏名最多 10 个字符，BV 标题最多保留两个游戏
   max_game_name_length: 10
   bv_title_max_games: 2
-  # 整场直播上传完成后，把所有分段的游戏统计结果加到 BV 标题前
+  # 开启后等待 Telegram 回复并修改 BV 标题
   update_bv_title: false
   bv_title_template: '【{GAMES}】{TITLE}'
   bv_title_separator: '|'
@@ -215,19 +217,34 @@ clean:
 ```
 
 **游戏名与 B 站标题说明**
-开启`ai_rename`后，程序不会截图，也不会调用视觉 AI。未设置`fixed_game`时，该分段不产生游戏名并立即继续上传；设置`fixed_game: true`后，直接使用`game`作为游戏名。默认`rename_files: false`，本地视频文件名保持不变；开启`rename_files: true`后，才会按`target_types`给本地文件名添加游戏前缀。
+开启`ai_rename`后，程序不会调用视觉 AI。直播结束时，如果启用了 TG，会为这场直播的每个视频截取开头的第一帧，并把截图合并发送。未设置`fixed_game`时，等待人工从截图判断；设置`fixed_game: true`后，先使用`game`。默认`rename_files: false`，本地视频文件名保持不变；开启`rename_files: true`后，才会按`target_types`给本地文件名添加游戏前缀。
 ```text
 oyo-2026年08月01日00点39分（弹幕版）.mp4
 -> 【三角洲行动】oyo-2026年08月01日00点39分（弹幕版）.mp4
 ```
 上面的文件名示例仅在`rename_files: true`时生效；默认不会修改本地文件名。
-开启`tg.enabled`后，每个视频会通过 Telegram Bot API 发送一条游戏名确认消息。推荐同时填写机器人`bot_token`（也支持字段`token`）和接收方`chat_id`；也可以直接写`tg: '123456:ABCDEF'`，程序会从机器人最近更新中自动发现唯一聊天，此时需要先向机器人发送一次`/start`。回复该消息`/update 游戏名`即可人工指定游戏名。发送失败只记录警告，不会中断录制或上传。Token会在调试日志中显示为`***`。
+开启`tg.enabled`后，直播结束时会通过 Telegram Bot API 发送一组首帧截图。Telegram 单个媒体组最多 10 张图片，超过时会拆成连续媒体组，但所有图片都对应同一场直播。推荐同时填写机器人`bot_token`（也支持字段`token`）和接收方`chat_id`；也可以直接写`tg: '123456:ABCDEF'`，程序会从机器人最近更新中自动发现唯一聊天，此时需要先向机器人发送一次`/start`。配置`tg.proxy`后，图片发送、自动发现`chat_id`和回复轮询都会通过该代理；可填写`http://host:port`、`socks5://host:port`或`socks5h://host:port`，只写`host:port`时默认按 HTTP 代理处理。使用 SOCKS5 代理需要安装`PySocks`。发送失败只记录警告，不会中断录制或上传。Token会在调试日志中显示为`***`。
 
-确认消息发出后，回复该消息并发送`/update 游戏名`，会把该场直播整条 BV 的游戏前缀人工覆盖为这个名字。例如配置`fixed_game: true`和`game: '三角洲行动'`时，未回复会使用默认前缀`【三角洲行动】`；回复`/update 瓦`后会改为`【瓦】`。其他回复不会修改标题。游戏名仍受`max_game_name_length`限制（默认10个字）。`reply_window`控制回复有效期，默认86400秒；若上传已完成但仍在有效期内，标题会再次修改，目标标题相同时不会重复提交。
+截图组发出后，回复其中任意一张图片并直接发送游戏名，例如`瓦`，会把该场直播整条 BV 的游戏前缀人工覆盖为这个名字。旧格式`/update 瓦`仍然兼容。例如配置`fixed_game: true`和`game: '三角洲行动'`时，程序会先提交默认前缀`【三角洲行动】`；回复图片并发送`瓦`后再改为`【瓦】`。其他未回复截图的消息不会修改标题。游戏名仍受`max_game_name_length`限制（默认10个字）。`reply_window`控制回复有效期，默认86400秒；若上传尚未完成，回复会先保存，待标题更新条件满足后再提交。
 
-开启`update_bv_title`后，程序会在整场直播的最后一个上传任务完成后，统计所有分段`games`数组中的非空游戏名，按出现次数降序生成标题。例如三角洲行动8次、幻兽帕鲁4次，则生成`【三角洲行动|幻兽帕鲁】{TITLE}`。该功能目前仅对 B 站上传生效；所有识别结果都为空时不修改标题。
+开启`update_bv_title`后，程序会等待 Telegram 的人工结果并修改 B 站标题；如果开启`fixed_game`，会先完成固定游戏名阶段，再处理人工覆盖。该功能目前仅对 B 站上传生效；没有固定游戏名且没有人工回复时不修改标题。
 
-开启`fixed_game`后，程序不会截图或调用 AI，而是直接把`game`作为每个分段的默认游戏名。开启`tg.enabled`后会额外发送文本消息，供人工用`/update`覆盖。默认仅更新 BV 标题；本地文件名前缀只有在同时开启`rename_files`时才会执行。`fixed_game`只有在任务同时开启`common_event_args.ai_rename`时生效。
+### Telegram 运行通知
+
+Python 程序复用全局或任务`ai_rename_args.tg`中的 Telegram 配置，发送直播开始、直播结束和 Python `ERROR`/`CRITICAL`日志通知。启用`tg.enabled`并填写`bot_token`、`chat_id`即可；通知发送失败不会影响录制、渲染或上传。
+
+可选配置：
+
+```yaml
+ai_rename_args:
+  tg:
+    notify_live_start: true
+    notify_live_end: true
+    notify_errors: true
+    notification_cooldown: 300
+```
+
+开启`fixed_game`后，程序不会自动识别，而是直接把`game`作为每个分段的默认游戏名。开启`tg.enabled`后会在直播结束时发送截图组，供人工回复图片并发送游戏名覆盖。默认仅更新 BV 标题；本地文件名前缀只有在同时开启`rename_files`时才会执行。`fixed_game`只有在任务同时开启`common_event_args.ai_rename`时生效。
 
 **自动上传的配置格式说明**      
 每个视频类型都可以指定一个或者多个上传任务，组成一个数组。特别地，如果只上传一个地方，则可以直接指定参数，不必使用数组，示例如下：

@@ -18,6 +18,7 @@ _SENSITIVE_KEYS = {
     'refresh_token',
     'bot_token',
     'token',
+    'proxy',
 }
 
 
@@ -38,8 +39,9 @@ def _redact_sensitive_data(value):
 
 
 class DMREngine():
-    def __init__(self):
+    def __init__(self, notifier=None):
         self.logger = logging.getLogger(__name__)
+        self.notifier = notifier
         self.task_dict = {}
         self.plugin_dict = {}
         self.recv_queue = None
@@ -48,6 +50,15 @@ class DMREngine():
     def pipeSend(self, message:PipeMessage):
         target = message.target
         self.logger.debug(_redact_sensitive_data(message))
+        if self.notifier and target.startswith('replay/') and message.source == 'downloader':
+            try:
+                taskname = target.split('/', 1)[1]
+                if message.event == 'livestart':
+                    self.notifier.live_started(taskname)
+                elif message.event == 'liveend':
+                    self.notifier.live_ended(taskname)
+            except Exception as error:
+                self.logger.debug(f'Telegram 直播事件通知失败: {error}')
         if target == 'engine':
             self.recv_queue.put(message)
         elif target.startswith('replay/'):

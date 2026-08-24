@@ -1,4 +1,5 @@
 requests
+PySocks
 aiohttp
 jsengine
 lxml

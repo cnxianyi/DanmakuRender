@@ -6,13 +6,14 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Tuple
 
-from DMR.utils import PipeMessage, VideoInfo, uuid
+from DMR.utils import PipeMessage, uuid
 
 from .parser import normalize_game
+from .screenshots import extract_first_frame
 from .telegram import (
     get_updates,
     parse_update_reply,
-    send_game_prompt,
+    send_frame_album,
     telegram_config,
     telegram_enabled,
 )
@@ -65,83 +66,133 @@ class AIRename():
         self._piperecvprocess.start()
 
     def add_task(self, msg: PipeMessage):
-        video: VideoInfo = msg.data['video']
+        data = msg.data or {}
+        videos = list(data.get('videos') or [])
+        if not videos and data.get('video') is not None:
+            videos = [data['video']]
+        if not videos:
+            raise ValueError('Telegram 截图任务没有视频')
         task = {
             'uuid': uuid(),
             'source': msg.source,
             'request_id': msg.request_id,
-            'video': video,
-            'args': msg.data.get('args', {}),
+            'videos': videos,
+            'group_id': data.get('group_id') or videos[0].group_id,
+            'args': data.get('args', {}),
         }
         with self._lock:
             self._tasks[task['uuid']] = task
-        self._executors.submit(self._recognize, task)
+        self._executors.submit(self._process_screenshots, task)
 
-    def _recognize(self, task):
-        video: VideoInfo = task['video']
+    def _process_screenshots(self, task):
+        videos = task['videos']
         args = task['args']
         result = {
-            'group_id': video.group_id,
-            'segment_id': video.segment_id,
-            'games': [],
-            'main_game': '',
+            'group_id': task['group_id'],
+            'screenshot_count': 0,
+            'failed_segments': [],
         }
+        frame_paths = []
         try:
-            fixed_result = args.get('_fixed_result')
-            if fixed_result is not None:
-                result.update(fixed_result)
+            for video in videos:
+                try:
+                    frame_paths.append((video, extract_first_frame(video, args)))
+                except Exception as error:
+                    result['failed_segments'].append(video.segment_id)
+                    self.logger.warning(f'视频 {video.path} 首帧截图失败，已跳过: {error}')
 
-            self._send_telegram_prompt(task, result)
-            game = result['main_game'] or '未设置游戏名'
-            action = '固定游戏处理完成' if fixed_result is not None else '游戏识别已停用'
+            if frame_paths:
+                result['screenshot_count'] = len(frame_paths)
+                self._send_telegram_album(task, frame_paths, result)
+            else:
+                self.logger.warning(f'直播组 {task["group_id"]} 没有可发送的 Telegram 截图.')
             self._pipeSend(
-                event='end',
-                msg=f'视频 {video.path} {action}: {game}',
+                event='screenshots_end',
+                msg=f'直播组 {task["group_id"]} Telegram 截图处理完成: {result["screenshot_count"]} 张',
                 target=task['source'],
                 request_id=task['request_id'],
                 data=result,
             )
         except Exception as e:
             result['error'] = str(e)
-            self.logger.warning(f'视频 {video.path} TG 处理失败，将保留原文件名: {e}')
+            self.logger.warning(f'直播组 {task["group_id"]} Telegram 截图处理失败: {e}')
             self._pipeSend(
-                event='error',
-                msg=f'视频 {video.path} TG 处理失败，将保留原文件名: {e}',
+                event='screenshots_error',
+                msg=f'直播组 {task["group_id"]} Telegram 截图处理失败: {e}',
                 target=task['source'],
                 request_id=task['request_id'],
                 data=result,
             )
         finally:
+            for _video, frame_path in frame_paths:
+                try:
+                    if os.path.exists(frame_path):
+                        os.remove(frame_path)
+                except OSError:
+                    self.logger.debug(f'无法删除 Telegram 截图临时文件: {frame_path}')
             with self._lock:
                 self._tasks.pop(task['uuid'], None)
 
-    def _send_telegram_prompt(self, task, result):
-        video = task['video']
+    def _caption(self, task, videos, args):
+        tg_config = telegram_config(args)
+        fixed_game = args.get('game', '') if args.get('fixed_game') else ''
+        segment_names = ', '.join(
+            str(video.segment_id) if video.segment_id is not None else '?'
+            for video in videos
+        )
+        game_line = f'当前固定游戏名：{fixed_game}\n' if fixed_game else '当前固定游戏名：未设置\n'
+        update_hint = (
+            '回复本相册中的任意图片并直接发送游戏名'
+            if args.get('update_bv_title') else ''
+        )
+        values = {
+            'TASKNAME': videos[0].taskname or task['source'].split('/', 1)[-1],
+            'COUNT': len(videos),
+            'SEGMENTS': segment_names,
+            'GROUP_ID': task['group_id'],
+            'GAME': fixed_game or '未设置游戏名',
+            'GAME_LINE': game_line.rstrip('\n'),
+            'UPDATE_HINT': update_hint,
+            # Keep the old placeholders valid for task-level custom captions.
+            'SEGMENT_ID': '',
+            'BASENAME': os.path.basename(videos[0].path),
+        }
+        template = tg_config.get(
+            'caption',
+            '{TASKNAME} | 直播结束 | {COUNT} 个视频\n'
+            '截图顺序：{SEGMENTS}\n{GAME_LINE}\n{UPDATE_HINT}',
+        )
+        try:
+            return str(template).format(**values).strip()
+        except (KeyError, ValueError):
+            return (
+                f'{values["TASKNAME"]} | 直播结束 | {len(videos)} 个视频\n'
+                f'截图顺序：{segment_names}\n{game_line}{update_hint}'
+            ).strip()
+
+    def _send_telegram_album(self, task, frame_items, result):
         args = task['args']
         if not telegram_enabled(args):
             return
+        frame_paths = [frame_path for _video, frame_path in frame_items]
         try:
-            caption_template = telegram_config(args).get(
-                'caption',
-                '{TASKNAME} | 分段 {SEGMENT_ID} | {GAME}\n'
-                '回复本消息：/update 游戏名',
+            album = send_frame_album(
+                frame_paths,
+                args,
+                caption=self._caption(task, [video for video, _path in frame_items], args),
             )
-            caption = str(caption_template).format(
-                TASKNAME=video.taskname or task['source'].split('/', 1)[-1],
-                SEGMENT_ID=video.segment_id if video.segment_id is not None else '',
-                GAME=result.get('main_game') or '未设置游戏名',
-                BASENAME=os.path.basename(video.path),
+            result['telegram'] = album
+            self._register_telegram_album(task, album)
+            self.logger.info(
+                f'直播组 {task["group_id"]} 的 {len(frame_paths)} 张首帧截图已发送到 Telegram.'
             )
-            notification = send_game_prompt(args, caption=caption)
-            result['telegram'] = notification
-            self._register_telegram_message(task, notification)
-            self.logger.info(f'视频 {video.path} 的 Telegram 游戏名确认消息已发送.')
         except Exception as error:
-            # Notifications must never block renaming, upload or recording.
-            self.logger.warning(f'视频 {video.path} 的 Telegram 消息发送失败: {error}')
+            # Notifications must never block recording, rendering or uploading.
+            result['telegram_error'] = str(error)
+            self.logger.warning(f'直播组 {task["group_id"]} 的 Telegram 截图发送失败: {error}')
 
-    def _register_telegram_message(self, task, notification):
-        if not notification or not notification.get('message_ids'):
+    def _register_telegram_album(self, task, album):
+        if not album or not album.get('message_ids') or not task['args'].get('update_bv_title'):
             return
         args = task['args']
         tg_config = telegram_config(args)
@@ -154,8 +205,7 @@ class AIRename():
         target = {
             'source': task['source'],
             'request_id': task['request_id'],
-            'group_id': task['video'].group_id,
-            'segment_id': task['video'].segment_id,
+            'group_id': task['group_id'],
             'game_config': {
                 'max_game_name_length': args.get('max_game_name_length', 10),
                 'excluded_names': args.get('excluded_names', []),
@@ -163,8 +213,8 @@ class AIRename():
             'expires_at': time.time() + reply_window,
         }
         with self._lock:
-            for message_id in notification['message_ids']:
-                self._telegram_targets[(monitor_key, str(notification['chat_id']), message_id)] = target
+            for message_id in album['message_ids']:
+                self._telegram_targets[(monitor_key, str(album['chat_id']), message_id)] = target
             monitor = self._telegram_monitors.get(monitor_key)
             if monitor is None or not monitor.is_alive():
                 monitor = threading.Thread(
@@ -200,7 +250,7 @@ class AIRename():
                         continue
                     game = normalize_game(command['game'], target['game_config'])
                     if not game:
-                        self.logger.warning('Telegram /update 的游戏名为空、过长或已被过滤，已忽略.')
+                        self.logger.warning('Telegram 回复的游戏名为空、过长或已被过滤，已忽略.')
                         continue
                     self._pipeSend(
                         event='telegram_update',
@@ -209,7 +259,6 @@ class AIRename():
                         request_id=target['request_id'],
                         data={
                             'group_id': target['group_id'],
-                            'segment_id': target['segment_id'],
                             'game': game,
                             'chat_id': command['chat_id'],
                             'reply_message_id': command['reply_message_id'],

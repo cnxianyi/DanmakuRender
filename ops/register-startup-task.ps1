@@ -17,6 +17,6 @@ $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arguments
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $taskSettings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
 
-Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $taskSettings -Description 'Runs DanmakuRender under an external watchdog and sends Bark alerts.' -Force | Out-Null
+Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $taskSettings -Description 'Runs DanmakuRender under an external watchdog and sends Telegram alerts.' -Force | Out-Null
 Write-Host "Registered scheduled task: $TaskName"
 Write-Host "Start it now with: Start-ScheduledTask -TaskName '$TaskName'"
