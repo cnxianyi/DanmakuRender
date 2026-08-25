@@ -2,7 +2,9 @@ import os
 import json
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+
+import requests
 
 from DMR.AIRename.bvtitle import build_bv_title, rank_games
 from DMR import _redact_sensitive_config
@@ -188,6 +190,36 @@ class TelegramTests(unittest.TestCase):
                 'https': 'socks5://127.0.0.1:1080',
             },
         )
+
+    @patch('DMR.AIRename.telegram.requests.post')
+    def test_retries_frame_album_after_timeout(self, post):
+        success = Mock()
+        success.ok = True
+        success.json.return_value = {
+            'ok': True,
+            'result': [
+                {'message_id': 301, 'chat': {'id': 123456}},
+            ],
+        }
+        post.side_effect = [requests.ReadTimeout('temporary timeout'), success]
+
+        with tempfile.TemporaryDirectory() as directory:
+            frame = os.path.join(directory, '0.jpg')
+            with open(frame, 'wb') as file:
+                file.write(b'jpeg')
+
+            sent = send_frame_album([frame], {
+                'tg': {
+                    'enabled': True,
+                    'bot_token': 'telegram-token',
+                    'chat_id': '123456',
+                    'retries': 1,
+                    'retry_interval': 0,
+                },
+            })
+
+        self.assertEqual(sent['message_ids'], [301])
+        self.assertEqual(post.call_count, 2)
 
 
 class ScreenshotTests(unittest.TestCase):

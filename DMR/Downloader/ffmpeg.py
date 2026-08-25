@@ -45,6 +45,11 @@ class FFmpegDownloader():
         self.logger = logging.getLogger(__name__)
         
         self.ffmpeg_proc = None
+        self.ffmpeg_monitor_proc = None
+        self.msg_queue = queue.Queue()
+        self.thisfile = None
+        self.raw_name = None
+        self.start_time = None
         self.stoped = False
     
     @property
@@ -52,6 +57,9 @@ class FFmpegDownloader():
         return datetime.now().timestamp() - self.start_time
         
     def start_ffmpeg(self):
+        if not isinstance(self.stream_url, str) or not self.stream_url.strip():
+            raise ValueError(f'{self.taskname}: 直播流地址为空，无法启动 FFmpeg.')
+
         ffmpeg_stream_args = self.advanced_video_args.get('ffmpeg_stream_args', 
                                                           [ '-rw_timeout','10000000',
                                                             '-analyzeduration','15000000',
@@ -88,16 +96,28 @@ class FFmpegDownloader():
         else:
             self.ffmpeg_proc = subprocess.Popen(ffmpeg_args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,bufsize=10**8, universal_newlines=True, encoding='utf-8', errors='ignore')
         
-        self.msg_queue = None
+        proc = self.ffmpeg_proc
+        msg_queue = self.msg_queue
+
         def ffmpeg_monitor():
+            stdout = proc.stdout
+            if stdout is None:
+                return
             while not self.stoped:
-                if self.ffmpeg_proc.stdout.readable():
-                    line = self.ffmpeg_proc.stdout.readline().strip()
-                    if len(line) > 0:
-                        self.msg_queue.put(line)
+                try:
+                    line = stdout.readline()
+                except (OSError, ValueError):
+                    return
+                if not line:
+                    if proc.poll() is not None:
+                        return
+                    time.sleep(0.1)
+                    continue
+                line = line.strip()
+                if line:
+                    msg_queue.put(line)
         
-        if self.ffmpeg_proc.stdout is not None:
-            self.msg_queue = queue.Queue()
+        if proc.stdout is not None:
             self.ffmpeg_monitor_proc = threading.Thread(target=ffmpeg_monitor, daemon=True)
             self.ffmpeg_monitor_proc.start()
 
@@ -105,6 +125,8 @@ class FFmpegDownloader():
     
     def start_helper(self):
         self.stoped = False
+        self.msg_queue = queue.Queue()
+        self.ffmpeg_monitor_proc = None
         self.raw_name = join(self.output_dir, f'[正在录制]{self.taskname}-{time.strftime("%Y%m%d-%H%M%S",time.localtime())}-Part%03d.{self.output_format}')
         self.start_time = datetime.now().timestamp()
         self._timer_cnt = 1
@@ -120,10 +142,26 @@ class FFmpegDownloader():
         
         self.download_stable = False # stable ffmpeg speed < 2
         while not self.stoped:
-            if self.ffmpeg_proc.poll() is not None:
-                self.logger.debug('FFmpeg exit.')
+            returncode = self.ffmpeg_proc.poll()
+            if returncode is not None:
+                self.logger.debug(f'FFmpeg exit, return code: {returncode}.')
                 self.logger.debug(log)
-                raise RuntimeError(f'FFmpeg 退出.')
+                lines = [
+                    line.strip()
+                    for line in log.splitlines()
+                    if line.strip() and not line.strip().startswith(('frame=', 'size='))
+                ]
+                error_keywords = (
+                    'error', 'fail', 'timeout', 'timed out', 'premature',
+                    'invalid', 'refused', 'reset by peer',
+                )
+                error_line = next((
+                    line
+                    for line in reversed(lines)
+                    if any(keyword in line.lower() for keyword in error_keywords)
+                ), lines[-1] if lines else '')
+                detail = f': {error_line[-500:]}' if error_line else ''
+                raise RuntimeError(f'FFmpeg 退出，返回码 {returncode}{detail}')
             
             if self.debug:
                 time.sleep(1)
@@ -204,24 +242,48 @@ class FFmpegDownloader():
             return
         self.stoped = True
         log = ''
-        try:
-            while self.msg_queue.qsize() > 0:
+        while True:
+            try:
                 msg = self.msg_queue.get_nowait()
-                log += msg+'\n'
-        except Exception as e:
-            self.logger.debug(e)
+            except queue.Empty:
+                break
+            log += msg+'\n'
         if log:
             self.logger.debug(f'{self.taskname} ffmpeg: {log}')
-            
-        try:
-            out, _ = self.ffmpeg_proc.communicate('q',timeout=3)
-            if out:
-                self.logger.debug(f'ffmpeg out: {out}.')
-        except Exception as e:
-            self.ffmpeg_proc.kill()
-            self.logger.debug(e)
-        
-        if self.thisfile:
+
+        proc = self.ffmpeg_proc
+        if proc is not None and proc.poll() is None:
+            def kill_and_wait():
+                try:
+                    proc.kill()
+                except OSError as error:
+                    self.logger.debug(error)
+                try:
+                    proc.wait(timeout=3)
+                except (subprocess.TimeoutExpired, OSError) as error:
+                    self.logger.debug(f'等待 FFmpeg 终止失败: {error}')
+
+            try:
+                if proc.stdin is not None:
+                    proc.stdin.write('q')
+                    proc.stdin.flush()
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                kill_and_wait()
+                self.logger.debug('FFmpeg 未在 3 秒内退出，已终止进程.')
+            except (BrokenPipeError, OSError, ValueError) as error:
+                self.logger.debug(error)
+                if proc.poll() is None:
+                    kill_and_wait()
+
+        monitor = self.ffmpeg_monitor_proc
+        if monitor is not None and monitor is not threading.current_thread():
+            monitor.join(timeout=1)
+
+        thisfile = self.thisfile
+        self.thisfile = None
+        self.ffmpeg_proc = None
+        if thisfile and self.segment_callback:
             time.sleep(1)
-            self.segment_callback(self.thisfile)
+            self.segment_callback(thisfile)
         self.logger.debug('ffmpeg downloader stoped.')

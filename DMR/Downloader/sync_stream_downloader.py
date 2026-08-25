@@ -29,7 +29,7 @@ class SyncStreamDownloadTask(StreamDownloadTask):
         self.segment_start_time = datetime.now()
         os.makedirs(self.output_dir,exist_ok=True)
         
-        stream_url = self.liveapi.GetStreamURL(**self.stream_option)
+        stream_url = self._get_stream_url()
         stream_request_header = self.liveapi.GetStreamHeader()
         # width, height = FFprobe.get_resolution(stream_url, stream_request_header)
         # 斗鱼和虎牙的直播地址只能用一次，所以要重新获取

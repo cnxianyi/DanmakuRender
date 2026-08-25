@@ -63,7 +63,7 @@ class LiveAPI():
         try:
             return self.api_class.get_stream_url(**kwargs)
         except Exception as e:
-            logger.debug(e)
+            logger.debug(f'GetStreamURL {self.platform, self.rid} Error: {e}')
 
     def GetStreamURLs(self, **kwargs):
         try:
@@ -75,7 +75,7 @@ class LiveAPI():
         try:
             return self.api_class.onair()
         except Exception as e:
-            logger.debug(e)
+            logger.debug(f'Onair {self.platform, self.rid} Error: {e}')
 
     def IsAvailable(self):
         try:

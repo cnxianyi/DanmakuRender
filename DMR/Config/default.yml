@@ -141,6 +141,11 @@ download_args:
       start_check_interval: 60
       # 下播检测间隔，在主播下播但是未超过延迟下播时间时使用
       stop_check_interval: 60
+      # 获取直播流地址失败时的快速重试次数和间隔（秒）
+      stream_url_retries: 3
+      stream_url_retry_interval: 1
+      # 录制稳定运行超过此时间后，重置断流重连的退避计数（秒）
+      restart_reset_after: 300
       # 录制组编号，可用于多任务协同，详情请参考文档
       group_id: ~
       # ffmpeg取流参数(仅ffmpeg下载引擎生效)

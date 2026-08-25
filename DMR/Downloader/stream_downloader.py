@@ -46,12 +46,15 @@ class StreamDownloadTask():
         self.segment = segment
         self.danmaku = danmaku
         self.video = video
-        self.stream_option = stream_option
+        self.stream_option = stream_option or {}
         self.stop_wait_time = stop_wait_time
         self.engine = engine or 'auto'
         self.advanced_video_args = advanced_video_args if advanced_video_args else {}
         self.advanced_dm_args = advanced_dm_args if advanced_dm_args else {}
         self.stoped = True
+        self.downloader = None
+        self.dmw = None
+        self.executor = None
 
         # if self.engine not in ['ffmpeg', 'streamlink', 'streamgears', 'pyrequests', 'auto']:
         #     raise NotImplementedError(f'No Downloader Named {self.engine}.')
@@ -75,6 +78,44 @@ class StreamDownloadTask():
     def stable_callback(self, time_error):
         if hasattr(self, 'dmw') and self.dmw:
             self.dmw.time_fix(time_error)
+
+    def _get_stream_url(self):
+        retries = max(1, int(self.advanced_video_args.get('stream_url_retries', 3)))
+        retry_interval = max(
+            0,
+            float(self.advanced_video_args.get('stream_url_retry_interval', 1)),
+        )
+        last_error = None
+
+        for attempt in range(1, retries + 1):
+            try:
+                stream_url = self.liveapi.GetStreamURL(**self.stream_option)
+            except Exception as error:
+                last_error = error
+                stream_url = None
+
+            if isinstance(stream_url, str) and stream_url.strip():
+                return stream_url.strip()
+
+            if attempt < retries:
+                self.logger.debug(
+                    f'{self.taskname}: 第 {attempt}/{retries} 次获取直播流地址失败，'
+                    f'{retry_interval:g} 秒后重试.'
+                )
+                if retry_interval:
+                    time.sleep(retry_interval)
+
+        detail = f': {last_error}' if last_error else ''
+        raise RuntimeError(
+            f'{self.taskname}: 连续 {retries} 次未获取到有效直播流地址{detail}'
+        )
+
+    def _get_onair_state(self):
+        state = self.liveapi.Onair()
+        if state is True or state is False:
+            return state
+        self.logger.debug(f'{self.taskname}: 无法确认当前直播状态，将稍后重试.')
+        return None
 
     def segment_callback(self, filename:str):
         if self.room_info is None or not exists(filename):
@@ -158,12 +199,12 @@ class StreamDownloadTask():
         self.segment_start_time = datetime.now()
         os.makedirs(self.output_dir,exist_ok=True)
         
-        stream_url = self.liveapi.GetStreamURL(**self.stream_option)
+        stream_url = self._get_stream_url()
         stream_request_header = self.liveapi.GetStreamHeader()
         width, height = FFprobe.get_resolution(stream_url, stream_request_header)
         # 斗鱼和虎牙的直播地址只能用一次，所以要重新获取
         if self.plat == 'douyu' or self.plat == 'huya':
-            stream_url = self.liveapi.GetStreamURL(**self.stream_option)
+            stream_url = self._get_stream_url()
 
         this_engine = self.engine
         if this_engine == 'auto':
@@ -268,6 +309,7 @@ class StreamDownloadTask():
         stop_waited = 0  # 已经等待的时间（下播但是还没停止）
         stop_wait_time = self.stop_wait_time*60    # 设定的等待时间
         live_end = False
+        live_started = False
         restart_cnt = 0     # 出错重启次数
         restart_interval = self.advanced_video_args.get('restart_interval', (0, 10, 60))  # 重启间隔时间
         if isinstance(restart_interval, (int, float)):
@@ -276,48 +318,79 @@ class StreamDownloadTask():
             restart_interval_min, restart_interval_step, restart_interval_max = 0, 10, 60
         start_check_interval = self.advanced_video_args.get('start_check_interval', 60)  # 开播检测时间
         stop_check_interval = self.advanced_video_args.get('stop_check_interval', 30)   # 下播检测间隔
+        restart_reset_after = max(
+            0,
+            float(self.advanced_video_args.get('restart_reset_after', 300)),
+        )
         
         self.sess_id = uuid(8)
         self.segment_id = 1
 
-        if not self.liveapi.Onair():
-            self._pipeSend('liveend', '直播已结束', )
-            live_end = True
-            time.sleep(start_check_interval)
-
         while self.loop:
-            if not self.liveapi.Onair():
+            onair = self._get_onair_state()
+            if onair is None:
+                check_interval = start_check_interval if live_end or not live_started else stop_check_interval
+                time.sleep(check_interval)
+                continue
+
+            if onair is False:
                 restart_cnt = 0
+                if not live_started and not live_end:
+                    self._pipeSend('liveend', '直播已结束')
+                    live_end = True
+                    time.sleep(start_check_interval)
+                    continue
+
                 if live_end:
                     time.sleep(start_check_interval)
-                    stop_waited += start_check_interval
-                else:
-                    time.sleep(stop_check_interval)
-                    stop_waited += stop_check_interval
+                    continue
+
+                time.sleep(stop_check_interval)
+                stop_waited += stop_check_interval
                 
                 if stop_waited > stop_wait_time and not live_end:
                     live_end = True
+                    live_started = False
                     self._pipeSend('liveend', '直播已结束', data=self.sess_id)
                     self.sess_id = uuid(8)          # 每场直播结束后重新分配session id
                     self.segment_id = 1
                 continue
 
-            try:
-                stop_waited = 0
+            stop_waited = 0
+            if live_end or not live_started:
                 live_end = False
+                live_started = True
                 self._pipeSend('livestart', '直播开始', dtype='str', data=self.sess_id)
+
+            attempt_started = time.monotonic()
+            try:
                 self.start_once()
-                if self.liveapi.Onair():
+                if not self.loop:
+                    break
+                if self._get_onair_state() is not False:
                     raise RuntimeError(f'{self.taskname} 录制异常退出.')
             except KeyboardInterrupt:
                 self.stop()
                 exit(0)
             except Exception as e:
-                if self.liveapi.Onair():
+                if not self.loop:
+                    break
+                if self._get_onair_state() is not False:
+                    if time.monotonic() - attempt_started >= restart_reset_after:
+                        restart_cnt = 0
+                    retry_delay = min(
+                        restart_interval_min + restart_interval_step * restart_cnt,
+                        restart_interval_max,
+                    )
                     self.logger.exception(e)
                     self.stop_once()
                     self._pipeSend('liveerror', f'录制过程出错:{e}', dtype='Exception', data=e)
-                    time.sleep(min(restart_interval_min + restart_interval_step * restart_cnt, restart_interval_max))
+                    self.logger.warning(
+                        f'{self.taskname}: 录制将在 {retry_delay:g} 秒后进行第 '
+                        f'{restart_cnt + 1} 次重试.'
+                    )
+                    if retry_delay:
+                        time.sleep(retry_delay)
                     restart_cnt += 1
                     continue
                 else:
@@ -338,18 +411,18 @@ class StreamDownloadTask():
 
     def stop_once(self):
         self.stoped = True
-        if self.video and hasattr(self, 'downloader'):
+        if self.video and self.downloader is not None:
             try:
                 self.downloader.stop()
             except Exception as e:
                 self.logger.exception(e)
-        if self.danmaku and hasattr(self, 'dmw') and self.dmw:
+        if self.danmaku and self.dmw is not None:
             try:
                 self.dmw.stop()
             except Exception as e:
                 self.logger.exception(e)
         try:
-            if hasattr(self, 'executor'):
+            if self.executor is not None:
                 self.executor.shutdown(wait=False)
         except Exception as e:
             self.logger.exception(e)
