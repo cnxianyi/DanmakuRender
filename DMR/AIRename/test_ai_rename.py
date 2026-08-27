@@ -7,6 +7,12 @@ from unittest.mock import Mock, patch
 import requests
 
 from DMR.AIRename.bvtitle import build_bv_title, rank_games
+from DMR.AIRename.clip import (
+    format_time,
+    kept_ranges,
+    parse_clip_command,
+    resolve_local_part,
+)
 from DMR import _redact_sensitive_config
 from DMR.engine import _redact_sensitive_data
 from DMR.AIRename.naming import rename_video
@@ -15,6 +21,7 @@ from DMR.AIRename.telegram import (
     get_updates,
     parse_update_reply,
     send_frame_album,
+    send_text_message,
     telegram_config,
     telegram_proxies,
 )
@@ -124,6 +131,53 @@ class TelegramTests(unittest.TestCase):
                 'text': '瓦',
             },
         }))
+
+    def test_parses_part_cut_reply(self):
+        command = parse_update_reply({
+            'update_id': 89,
+            'message': {
+                'message_id': 202,
+                'chat': {'id': 123456},
+                'text': 'P3 [[03:00,05:00], [08:00,40:00]]',
+                'reply_to_message': {'message_id': 101},
+            },
+        })
+
+        self.assertEqual(command['clip'], {
+            'part_number': 3,
+            'remove_ranges': [[180.0, 300.0], [480.0, 2400.0]],
+        })
+        malformed = parse_update_reply({
+            'message': {
+                'message_id': 203,
+                'chat': {'id': 123456},
+                'text': 'P3 03:00,05:00',
+                'reply_to_message': {'message_id': 101},
+            },
+        })
+        self.assertIn('clip_error', malformed)
+
+    @patch('DMR.AIRename.telegram.requests.post')
+    def test_sends_text_message_as_a_reply(self, post):
+        post.return_value.json.return_value = {
+            'ok': True,
+            'result': {'message_id': 204},
+        }
+
+        result = send_text_message(
+            {
+                'tg': {
+                    'bot_token': 'telegram-token',
+                    'chat_id': '123456',
+                    'retries': 0,
+                },
+            },
+            '处理中',
+            reply_to_message_id=203,
+        )
+
+        self.assertEqual(result['message_id'], 204)
+        self.assertEqual(post.call_args.kwargs['data']['reply_to_message_id'], '203')
 
     @patch('DMR.AIRename.telegram.requests.post')
     def test_sends_frame_album_and_returns_all_message_ids(self, post):
@@ -248,6 +302,65 @@ class ScreenshotTests(unittest.TestCase):
             finally:
                 if os.path.exists(frame):
                     os.remove(frame)
+
+
+class ClipCommandTests(unittest.TestCase):
+    def test_parses_single_multiple_and_open_ranges(self):
+        self.assertEqual(
+            parse_clip_command('P3 [03:00,45:00]').remove_ranges,
+            ((180.0, 2700.0),),
+        )
+        self.assertEqual(
+            parse_clip_command('P3 [[03:00,05:00],[08:00,40:00]]').remove_ranges,
+            ((180.0, 300.0), (480.0, 2400.0)),
+        )
+        self.assertEqual(
+            parse_clip_command('P3 [,03:00]').remove_ranges,
+            ((None, 180.0),),
+        )
+        self.assertEqual(
+            parse_clip_command('P3 [45:00,]').remove_ranges,
+            ((2700.0, None),),
+        )
+
+    def test_normalizes_ranges_and_computes_complement(self):
+        cuts, keep = kept_ranges(
+            [(180, 300), (240, 360), (480, 2400)],
+            3600,
+        )
+        self.assertEqual(cuts, [(180.0, 360.0), (480.0, 2400.0)])
+        self.assertEqual(keep, [(0.0, 180.0), (360.0, 480.0), (2400.0, 3600.0)])
+        with self.assertRaises(ValueError):
+            kept_ranges([(None, None)], 3600)
+        with self.assertRaises(ValueError):
+            kept_ranges([(3601, None)], 3600)
+
+    def test_requires_part_and_brackets(self):
+        self.assertIsNone(parse_clip_command('[03:00,05:00]'))
+        self.assertIsNone(parse_clip_command('P3'))
+        with self.assertRaises(ValueError):
+            parse_clip_command('P0 [03:00,05:00]')
+        with self.assertRaises(ValueError):
+            parse_clip_command('P3 []')
+
+    def test_resolves_only_an_exact_local_part_title(self):
+        with tempfile.TemporaryDirectory() as directory:
+            expected = os.path.join(directory, 'oyo-2026年08月27日00点00分（弹幕版）.mp4')
+            other = os.path.join(directory, 'oyo-2026年08月27日01点00分（弹幕版）.mp4')
+            open(expected, 'wb').close()
+            open(other, 'wb').close()
+            self.assertEqual(
+                resolve_local_part(
+                    'oyo-2026年08月27日00点00分（弹幕版）',
+                    [other, expected],
+                ),
+                expected,
+            )
+            with self.assertRaises(FileNotFoundError):
+                resolve_local_part('不存在', [expected, other])
+
+    def test_formats_rounding_without_sixty_seconds(self):
+        self.assertEqual(format_time(3599.9996), '01:00:00')
 
 
 class BVTitleTests(unittest.TestCase):
@@ -534,12 +647,22 @@ class LiveEventsAIRenameTests(unittest.TestCase):
             target='replay/test',
             event='telegram_update',
             request_id='ai-request',
-            data={'group_id': 'group', 'game': '瓦'},
+            data={
+                'group_id': 'group',
+                'game': '瓦',
+                'chat_id': '123456',
+                'command_message_id': 203,
+            },
         ))
 
         self.assertEqual(len(override), 1)
         self.assertTrue(override[0].data['title'].startswith('【瓦】'))
         self.assertNotIn('三角洲行动', override[0].data['title'])
+        self.assertEqual(override[0].data['games'], ['瓦'])
+        self.assertEqual(override[0].data['telegram'], {
+            'chat_id': '123456',
+            'reply_to_message_id': 203,
+        })
         self.assertEqual(events.onTelegramUpdate(PipeMessage(
             source='ai_rename',
             target='replay/test',
@@ -607,6 +730,111 @@ class LiveEventsAIRenameTests(unittest.TestCase):
         self.assertEqual(len(manual_messages), 1)
         self.assertEqual(manual_messages[0].data['phase'], 'manual')
         self.assertTrue(manual_messages[0].data['title'].startswith('【瓦】'))
+
+    def test_telegram_clip_routes_unique_bv_and_local_candidates(self):
+        events = LiveEvents('test', self._config())
+        events.ended_dict['group'] = 1
+        local = VideoInfo(
+            path='/videos/oyo-2026年08月27日00点00分（弹幕版）.mp4',
+            group_id='group',
+        )
+        events.state_dict['group'] = [{
+            'src_video': {'status': 'cleaned', 'file': None, 'wait': []},
+            'src_video_pre': {'status': None, 'file': None, 'wait': []},
+            'dm_video': {'status': 'uploaded', 'file': local, 'wait': []},
+        }]
+        events.bv_title_dict['group'] = {
+            'uploads': {
+                'group_dm_video_0': {
+                    'bvid': 'BV1nE8Z63EEy',
+                    'engine': 'biliuprs',
+                    'args': {'account': 'bilibili', 'line': 'AUTO'},
+                },
+            },
+        }
+
+        message = events.onTelegramClip(PipeMessage(
+            source='ai_rename',
+            target='replay/test',
+            event='telegram_clip',
+            data={
+                'group_id': 'group',
+                'part_number': 3,
+                'remove_ranges': [[180, 300]],
+                'chat_id': '123456',
+                'command_message_id': 202,
+            },
+        ))
+
+        self.assertEqual(message.target, 'uploader')
+        self.assertEqual(message.event, 'replace_bv_part')
+        self.assertEqual(message.data['bvid'], 'BV1nE8Z63EEy')
+        self.assertEqual(message.data['part_number'], 3)
+        self.assertEqual(message.data['candidate_paths'], [local.path])
+
+    def test_title_and_clip_callbacks_build_telegram_result_messages(self):
+        config = self._config()
+        config['ai_rename_args']['tg'] = {
+            'enabled': True,
+            'bot_token': 'token',
+            'chat_id': '123456',
+        }
+        events = LiveEvents('test', config)
+
+        title_messages = events.onBVTitleEnd(PipeMessage(
+            source='uploader',
+            target='replay/test',
+            event='title/end',
+            data={
+                'group_id': 'group',
+                'bvid': 'BV1TR8X63EQW',
+                'title': '【三角洲行动】直播回放',
+                'games': ['三角洲行动'],
+                'phase': 'manual',
+                'telegram': {'chat_id': '123456', 'reply_to_message_id': 203},
+            },
+        ))
+        self.assertEqual(len(title_messages), 1)
+        self.assertEqual(
+            title_messages[0].data['text'],
+            '更新标题 三角洲行动 成功\nBV1TR8X63EQW',
+        )
+        self.assertEqual(title_messages[0].data['reply_to_message_id'], 203)
+
+        title_error_messages = events.onBVTitleError(PipeMessage(
+            source='uploader',
+            target='replay/test',
+            event='title/error',
+            data={
+                'group_id': 'group',
+                'bvid': 'BV1TR8X63EQW',
+                'games': ['三角洲行动'],
+                'phase': 'manual',
+                'error': '稿件被锁定',
+                'telegram': {'chat_id': '123456', 'reply_to_message_id': 203},
+            },
+        ))
+        self.assertEqual(
+            title_error_messages[0].data['text'],
+            '更新标题 三角洲行动 失败\nBV1TR8X63EQW\n原因：稿件被锁定',
+        )
+
+        clip_message = events.onBVClipEnd(PipeMessage(
+            source='uploader',
+            target='replay/test',
+            event='clip/end',
+            data={
+                'bvid': 'BV1TR8X63EQW',
+                'part_number': 3,
+                'verified': True,
+                'part_title': 'P3-title',
+                'removed_ranges_text': '[00:03:00,00:05:00]',
+                'duration_text': '00:58:00',
+                'telegram': {'chat_id': '123456', 'reply_to_message_id': 204},
+            },
+        ))
+        self.assertTrue(clip_message.data['text'].startswith('P3 BV1TR8X63EQW 更新成功\n'))
+        self.assertEqual(clip_message.data['reply_to_message_id'], 204)
 
 
 if __name__ == '__main__':

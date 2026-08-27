@@ -1,4 +1,5 @@
 import logging
+import os
 import threading
 import queue
 import time
@@ -112,6 +113,8 @@ class Uploader():
                         self.add_task(message)
                     elif message.event == 'edit_bv_title':
                         self._queue_bv_title_edit(message)
+                    elif message.event == 'replace_bv_part':
+                        self._queue_bv_part_replace(message)
             except Exception as e:
                 self.logger.error(f'Message:{message} raise an error.')
                 self.logger.exception(e)
@@ -193,6 +196,135 @@ class Uploader():
             title_lock = self._bv_title_locks.setdefault(bvid, threading.Lock())
         self.upload_executors.submit(self._edit_bv_title, message, title_lock)
 
+    def _queue_bv_part_replace(self, message:PipeMessage):
+        bvid = str((message.data or {}).get('bvid') or '')
+        if not re.fullmatch(r'BV[0-9A-Za-z]{10}', bvid):
+            raise ValueError(f'无效的 BVID：{bvid}')
+        with self._lock:
+            bv_lock = self._bv_title_locks.setdefault(bvid, threading.Lock())
+        self.upload_executors.submit(self._replace_bv_part, message, bv_lock)
+
+    def _replace_bv_part(self, message:PipeMessage, bv_lock=None):
+        config = message.data or {}
+        bvid = config.get('bvid')
+        part_number = config.get('part_number')
+        temp_dir = None
+        output_path = None
+        submitted = False
+        verified = False
+        uploader = None
+        bv_lock = bv_lock or self._bv_title_locks.setdefault(bvid, threading.Lock())
+        try:
+            part_number = int(part_number)
+            from .biliwebapi import BiliWebApi
+            from DMR.AIRename.clip import (
+                cut_video,
+                format_ranges,
+                format_time,
+                resolve_local_part,
+            )
+
+            with bv_lock:
+                uploader = BiliWebApi(**(config.get('args') or {}))
+                remote = uploader.get_remote_data(bvid)
+                if remote is None:
+                    raise RuntimeError(f'无法读取 B 站稿件 {bvid} 的编辑信息')
+                if part_number < 1 or part_number > len(remote.videos):
+                    raise ValueError(
+                        f'{bvid} 只有 {len(remote.videos)} 个分P，找不到 P{part_number}'
+                    )
+
+                remote_part = remote.videos[part_number - 1]
+                part_title = remote_part.get('title') or ''
+                source_path = resolve_local_part(part_title, config.get('candidate_paths') or [])
+                temp_dir = os.path.abspath(join('.temp', 'clips', uuid()))
+                os.makedirs(temp_dir, exist_ok=False)
+                output_path = join(temp_dir, os.path.basename(source_path))
+
+                self.logger.info(
+                    f'开始剪辑 {bvid} P{part_number}（{part_title}），源文件: {source_path}'
+                )
+                clip_result = cut_video(
+                    source_path,
+                    output_path,
+                    config.get('remove_ranges') or [],
+                    config.get('render_args') or {},
+                )
+                replacement = uploader.replace_video_part(
+                    bvid=bvid,
+                    part_number=part_number,
+                    filepath=output_path,
+                    lines=(config.get('args') or {}).get('line') or 'AUTO',
+                    expected_cid=remote_part.get('cid'),
+                    expected_title=part_title,
+                )
+                submitted = True
+                verified = bool(replacement.get('verified'))
+
+            uploader.stop()
+
+            data = {
+                'bvid': bvid,
+                'part_number': part_number,
+                'part_title': part_title,
+                'old_cid': remote_part.get('cid'),
+                'new_cid': (replacement.get('verified_part') or {}).get('cid'),
+                'verified': verified,
+                'removed_ranges': clip_result['removed_ranges'],
+                'removed_ranges_text': format_ranges(clip_result['removed_ranges']),
+                'duration': clip_result['duration'],
+                'duration_text': format_time(clip_result['duration']),
+                'source_path': source_path,
+                'temporary_file': None if verified else output_path,
+                'group_id': config.get('group_id'),
+                'telegram': config.get('telegram') or {},
+            }
+            if verified:
+                try:
+                    os.remove(output_path)
+                    os.rmdir(temp_dir)
+                except OSError as error:
+                    self.logger.warning(f'无法清理已验证的剪辑临时文件 {output_path}: {error}')
+            else:
+                self.logger.warning(
+                    f'{bvid} P{part_number} 的更换请求已成功提交，但未能自动验证；'
+                    f'临时文件保留在 {output_path}'
+                )
+            self._pipeSend(
+                event='clip/end',
+                msg=f'B 站稿件 {bvid} P{part_number} 更换视频已提交',
+                target=message.source,
+                request_id=message.request_id,
+                dtype='dict',
+                data=data,
+            )
+        except Exception as error:
+            if uploader is not None:
+                uploader.stop()
+            if temp_dir and not (output_path and exists(output_path)):
+                try:
+                    os.rmdir(temp_dir)
+                except OSError:
+                    pass
+            self.logger.exception(error)
+            self._pipeSend(
+                event='clip/error',
+                msg=f'B 站稿件 {bvid} P{part_number} 剪辑或更换失败: {error}',
+                target=message.source,
+                request_id=message.request_id,
+                dtype=str(type(error)),
+                data={
+                    'bvid': bvid,
+                    'part_number': part_number,
+                    'error': str(error),
+                    'submitted': submitted,
+                    'verified': verified,
+                    'temporary_file': output_path if output_path and exists(output_path) else None,
+                    'group_id': config.get('group_id'),
+                    'telegram': config.get('telegram') or {},
+                },
+            )
+
     def _is_latest_bv_title_request(self, bvid, request_id):
         with self._lock:
             return self._latest_bv_title_requests.get(bvid) == request_id
@@ -245,6 +377,8 @@ class Uploader():
                     'changed': changed,
                     'group_id': config.get('group_id'),
                     'phase': config.get('phase'),
+                    'games': config.get('games') or [],
+                    'telegram': config.get('telegram') or {},
                 },
             )
         except Exception as e:
@@ -261,6 +395,8 @@ class Uploader():
                     'error': str(e),
                     'group_id': config.get('group_id'),
                     'phase': config.get('phase'),
+                    'games': config.get('games') or [],
+                    'telegram': config.get('telegram') or {},
                 },
             )
         finally:

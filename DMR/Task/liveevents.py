@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 from .baseevents import BaseEvents
 from ..AIRename.naming import rename_video
 from ..AIRename.parser import fixed_game_result, normalize_game
@@ -15,6 +16,7 @@ class LiveEvents(BaseEvents):
         self.bv_title_dict = {}
         self.bv_manual_game_dict = {}
         self.bv_pending_manual_game_dict = {}
+        self.bv_manual_telegram_dict = {}
         self.telegram_screenshot_dict = {}
         self.logger = logging.getLogger(__name__)
 
@@ -34,10 +36,13 @@ class LiveEvents(BaseEvents):
             'ai_rename/screenshots_end': self.onTelegramScreenshotsEnd,
             'ai_rename/screenshots_error': self.onTelegramScreenshotsEnd,
             'ai_rename/telegram_update': self.onTelegramUpdate,
+            'ai_rename/telegram_clip': self.onTelegramClip,
             'uploader/end': self.onUploadEnd,
             'uploader/error': self.defaultEvent,
             'uploader/title/end': self.onBVTitleEnd,
             'uploader/title/error': self.onBVTitleError,
+            'uploader/clip/end': self.onBVClipEnd,
+            'uploader/clip/error': self.onBVClipError,
             'cleaner/end': self.defaultEvent,
             'cleaner/error': self.defaultEvent,
             'default': self.defaultEvent,
@@ -372,6 +377,7 @@ class LiveEvents(BaseEvents):
                 'account': args.get('account'),
                 'cookies': args.get('cookies'),
                 'limit': args.get('limit', 3),
+                'line': args.get('line'),
             },
         }
 
@@ -448,6 +454,7 @@ class LiveEvents(BaseEvents):
                         'title': title,
                         'group_id': group_id,
                         'phase': 'fixed',
+                        'games': games,
                         'args': upload.get('args') or {},
                         'delay': config.get('bv_title_delay', 10),
                         'retries': config.get('bv_title_retries', 2),
@@ -497,6 +504,8 @@ class LiveEvents(BaseEvents):
                     'title': title,
                     'group_id': group_id,
                     'phase': 'manual' if manual_game else 'normal',
+                    'games': games,
+                    'telegram': self.bv_manual_telegram_dict.get(group_id) if manual_game else None,
                     'args': upload.get('args') or {},
                     'delay': config.get('bv_title_delay', 10),
                     'retries': config.get('bv_title_retries', 2),
@@ -633,6 +642,11 @@ class LiveEvents(BaseEvents):
             return
 
         self.bv_pending_manual_game_dict[group_id] = game
+        if data.get('chat_id') is not None:
+            self.bv_manual_telegram_dict[group_id] = {
+                'chat_id': data.get('chat_id'),
+                'reply_to_message_id': data.get('command_message_id'),
+            }
         if ai_state is not None:
             ai_state['manual_game'] = game
         fixed_result = fixed_game_result(self.config.get('ai_rename_args', {}))
@@ -654,6 +668,133 @@ class LiveEvents(BaseEvents):
         # Before upload completion this stores the override for the normal final edit;
         # after completion it queues another edit only when the target title changed.
         return self._check_for_bv_title(group_id)
+
+    def _telegram_status_message(self, text, data):
+        return PipeMessage(
+            source=self.name,
+            target='ai_rename',
+            event='telegram_message',
+            request_id=uuid(),
+            data={
+                'args': self.config.get('ai_rename_args', {}),
+                'text': text,
+                'chat_id': data.get('chat_id'),
+                'reply_to_message_id': data.get('reply_to_message_id', data.get('command_message_id')),
+            },
+        )
+
+    def _telegram_enabled(self):
+        tg_config = self.config.get('ai_rename_args', {}).get('tg')
+        if isinstance(tg_config, str):
+            return bool(tg_config.strip())
+        return bool(isinstance(tg_config, dict) and tg_config.get('enabled'))
+
+    def _bv_title_status_message(self, data, success):
+        if not self._telegram_enabled():
+            return None
+        games = [str(game).strip() for game in data.get('games') or [] if str(game).strip()]
+        game_text = '|'.join(games)
+        if not game_text:
+            match = re.match(r'^【([^】]+)】', str(data.get('title') or ''))
+            game_text = match.group(1) if match else '视频标题'
+        status = '成功' if success else '失败'
+        text = f'更新标题 {game_text} {status}\n{data.get("bvid")}'
+        if not success and data.get('error'):
+            text += f'\n原因：{data["error"]}'
+        return self._telegram_status_message(text, data.get('telegram') or {})
+
+    def onTelegramClip(self, message:PipeMessage):
+        data = message.data or {}
+        group_id = data.get('group_id')
+        part_number = data.get('part_number')
+        if not group_id or group_id not in self.state_dict:
+            return self._telegram_status_message('找不到该直播组，可能已过回复有效期。', data)
+        if not self._group_work_complete(group_id):
+            return self._telegram_status_message('该直播组尚未完成渲染和上传，请稍后重试。', data)
+
+        title_state = self.bv_title_dict.get(group_id) or {}
+        uploads = [
+            upload for upload in (title_state.get('uploads') or {}).values()
+            if upload.get('bvid') and upload.get('engine') in ('biliuprs', 'biliwebapi')
+        ]
+        bvids = {upload['bvid'] for upload in uploads}
+        if len(bvids) != 1:
+            return self._telegram_status_message(
+                f'无法唯一确定目标 BV（找到 {len(bvids)} 个），已拒绝执行。',
+                data,
+            )
+        bvid = next(iter(bvids))
+        upload = next(upload for upload in uploads if upload['bvid'] == bvid)
+
+        candidate_paths = []
+        for video_state in self.state_dict[group_id]:
+            for info in video_state.values():
+                file = info.get('file')
+                path = getattr(file, 'path', None) if file is not None else None
+                if path and path not in candidate_paths:
+                    candidate_paths.append(path)
+
+        self.logger.info(
+            f'{self.name}: Telegram 请求剪辑 {bvid} P{part_number}，'
+            f'剪除区间: {data.get("remove_ranges")}.'
+        )
+        return PipeMessage(
+            source=self.name,
+            target='uploader',
+            event='replace_bv_part',
+            request_id=uuid(),
+            data={
+                'bvid': bvid,
+                'part_number': part_number,
+                'remove_ranges': data.get('remove_ranges') or [],
+                'candidate_paths': candidate_paths,
+                'group_id': group_id,
+                'args': upload.get('args') or {},
+                'render_args': (self.config.get('render_args') or {}).get('dmrender') or {},
+                'telegram': {
+                    'chat_id': data.get('chat_id'),
+                    'reply_to_message_id': data.get('command_message_id'),
+                },
+            },
+        )
+
+    def onBVClipEnd(self, message:PipeMessage):
+        data = message.data or {}
+        self.logger.info(f'{self.name}: {message.msg}')
+        verification = (
+            '已核验 B 站中的目标分P。'
+            if data.get('verified')
+            else 'B站已接受更换请求，但暂未从编辑接口读回新视频，请稍后在创作中心确认。'
+        )
+        return self._telegram_status_message(
+            (
+                f'P{data.get("part_number")} {data.get("bvid")} '
+                f'{"更新成功" if data.get("verified") else "更新已提交（待确认）"}\n'
+                f'分P：{data.get("part_title")}\n'
+                f'剪除：{data.get("removed_ranges_text")}\n'
+                f'新时长：{data.get("duration_text")}\n'
+                f'{verification}\n'
+                'B站将重新处理并审核该分P。'
+            ),
+            {
+                'chat_id': (data.get('telegram') or {}).get('chat_id'),
+                'command_message_id': (data.get('telegram') or {}).get('reply_to_message_id'),
+            },
+        )
+
+    def onBVClipError(self, message:PipeMessage):
+        data = message.data or {}
+        self.logger.warning(f'{self.name}: {message.msg}')
+        return self._telegram_status_message(
+            (
+                f'P{data.get("part_number")} {data.get("bvid")} 更新失败\n'
+                f'原因：{data.get("error") or message.msg}'
+            ),
+            {
+                'chat_id': (data.get('telegram') or {}).get('chat_id'),
+                'command_message_id': (data.get('telegram') or {}).get('reply_to_message_id'),
+            },
+        )
 
     def onTelegramScreenshotsEnd(self, message:PipeMessage):
         data = message.data or {}
@@ -692,7 +833,10 @@ class LiveEvents(BaseEvents):
         if state and phase == 'fixed':
             state.setdefault('fixed_queued', set()).discard(bvid)
             state.setdefault('fixed_applied', set()).add(bvid)
-        return self._check_for_bv_title(group_id)
+        ret_msgs = self._check_for_bv_title(group_id)
+        if notification := self._bv_title_status_message(data, success=True):
+            ret_msgs.append(notification)
+        return ret_msgs
 
     def onBVTitleError(self, message:PipeMessage):
         data = message.data or {}
@@ -708,7 +852,10 @@ class LiveEvents(BaseEvents):
             # Let a manual answer proceed even if the initial fixed update failed.
             state.setdefault('fixed_failed', set()).add(bvid)
         self.logger.warning(f'{self.name}: 视频组 {group_id} 的 BV {bvid} 标题修改失败，阶段: {phase}.')
-        return self._check_for_bv_title(group_id)
+        ret_msgs = self._check_for_bv_title(group_id)
+        if notification := self._bv_title_status_message(data, success=False):
+            ret_msgs.append(notification)
+        return ret_msgs
     
     def _check_for_clean(self, group_id=None):
         ret_msgs = []
@@ -778,7 +925,11 @@ class LiveEvents(BaseEvents):
             if isinstance(tg_config, str):
                 tg_config = {'enabled': True}
             reply_window = max(0, float(tg_config.get('reply_window', 86400)))
-            if need_free and self.config.get('ai_rename_args', {}).get('update_bv_title') and tg_config.get('enabled') and reply_window and \
+            telegram_actions_enabled = (
+                self.config.get('ai_rename_args', {}).get('update_bv_title')
+                or tg_config.get('clip_enabled')
+            )
+            if need_free and telegram_actions_enabled and tg_config.get('enabled') and reply_window and \
                     time.time() - self.ended_dict[group_id] < reply_window:
                 # Keep only lightweight state long enough to accept a late Telegram reply.
                 need_free = False
@@ -790,6 +941,7 @@ class LiveEvents(BaseEvents):
                 self.bv_title_dict.pop(group_id, None)
                 self.bv_manual_game_dict.pop(group_id, None)
                 self.bv_pending_manual_game_dict.pop(group_id, None)
+                self.bv_manual_telegram_dict.pop(group_id, None)
                 self.telegram_screenshot_dict.pop(group_id, None)
                 self.upload_request_dict = {
                     request_id: upload
@@ -811,6 +963,7 @@ class LiveEvents(BaseEvents):
                 self.bv_title_dict.pop(group_id, None)
                 self.bv_manual_game_dict.pop(group_id, None)
                 self.bv_pending_manual_game_dict.pop(group_id, None)
+                self.bv_manual_telegram_dict.pop(group_id, None)
                 self.telegram_screenshot_dict.pop(group_id, None)
                 self.upload_request_dict = {
                     request_id: upload
@@ -877,6 +1030,7 @@ class LiveEvents(BaseEvents):
         self.bv_title_dict.clear()
         self.bv_manual_game_dict.clear()
         self.bv_pending_manual_game_dict.clear()
+        self.bv_manual_telegram_dict.clear()
         self.telegram_screenshot_dict.clear()
         return PipeMessage(
             source=self.name,

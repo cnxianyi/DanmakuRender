@@ -8,6 +8,8 @@ from urllib.parse import urlsplit
 
 import requests
 
+from .clip import parse_clip_command
+
 
 _DISCOVERED_CHAT_IDS = {}
 
@@ -244,6 +246,54 @@ def send_frame_album(frame_paths, config, caption=''):
     }
 
 
+def send_text_message(config, text, chat_id=None, reply_to_message_id=None):
+    """Send a Telegram status message without letting notification errors escape."""
+    tg_config = telegram_config(config)
+    token = str(tg_config.get('bot_token') or tg_config.get('token') or '').strip()
+    if not token:
+        raise ValueError('tg.bot_token（或 tg.token）未配置')
+    target_chat_id = str(chat_id or tg_config.get('chat_id') or '').strip()
+    if not target_chat_id:
+        raise ValueError('tg.chat_id 未配置')
+
+    api_base = str(tg_config.get('api_base') or 'https://api.telegram.org').rstrip('/')
+    timeout = max(1, float(tg_config.get('timeout', 60)))
+    retries = max(0, int(tg_config.get('retries', 2)))
+    retry_interval = max(0, float(tg_config.get('retry_interval', 2)))
+    data = {
+        'chat_id': target_chat_id,
+        'text': str(text)[:4096],
+    }
+    message_thread_id = tg_config.get('message_thread_id')
+    if message_thread_id not in (None, ''):
+        data['message_thread_id'] = str(message_thread_id)
+    if reply_to_message_id is not None:
+        data['reply_to_message_id'] = str(reply_to_message_id)
+        data['allow_sending_without_reply'] = 'true'
+    if tg_config.get('disable_notification'):
+        data['disable_notification'] = 'true'
+
+    last_error = None
+    for attempt in range(retries + 1):
+        try:
+            response = requests.post(
+                f'{api_base}/bot{token}/sendMessage',
+                data=data,
+                timeout=timeout,
+                proxies=telegram_proxies(tg_config),
+            )
+            response.raise_for_status()
+            body = response.json()
+            if not body.get('ok'):
+                raise RuntimeError(body.get('description') or 'sendMessage 返回失败')
+            return body.get('result') or {}
+        except (OSError, requests.RequestException, RuntimeError, ValueError) as error:
+            last_error = str(error).replace(token, '***')
+            if attempt < retries and retry_interval:
+                time.sleep(retry_interval)
+    raise RuntimeError(f'Telegram 消息发送失败: {last_error}')
+
+
 def get_updates(config, offset=None):
     """Long-poll Telegram updates for manual title overrides."""
     tg_config = telegram_config(config)
@@ -279,27 +329,49 @@ def get_updates(config, offset=None):
 
 
 def parse_update_reply(update):
-    """Return a game name from a reply to a tracked Telegram screenshot."""
+    """Return a game override or part-cut command from a tracked reply."""
     if not isinstance(update, dict):
         return None
     message = update.get('message') or update.get('edited_message') or {}
     text = str(message.get('text') or message.get('caption') or '').strip()
+    clip = None
+    clip_error = None
+    if re.match(r'^\s*[Pp]\s*\d+', text):
+        try:
+            clip = parse_clip_command(text)
+            if clip is None:
+                raise ValueError('格式应为 P3 [开始,结束]')
+        except ValueError as error:
+            clip_error = str(error)
+
     match = UPDATE_COMMAND_PATTERN.fullmatch(text)
     if match:
         game = match.group(1).strip()
-    elif text and not text.startswith('/'):
+    elif text and not text.startswith('/') and clip is None and clip_error is None:
         game = text
     else:
         game = ''
     reply = message.get('reply_to_message') or {}
     chat_id = (message.get('chat') or {}).get('id')
     reply_message_id = reply.get('message_id')
-    if not game or chat_id is None or reply_message_id is None:
+    if chat_id is None or reply_message_id is None:
         return None
-    return {
+    command = {
         'update_id': update.get('update_id'),
         'chat_id': str(chat_id),
         'reply_message_id': reply_message_id,
         'message_id': message.get('message_id'),
-        'game': game,
     }
+    if clip is not None:
+        command['clip'] = {
+            'part_number': clip.part_number,
+            'remove_ranges': [list(item) for item in clip.remove_ranges],
+        }
+        return command
+    if clip_error is not None:
+        command['clip_error'] = clip_error
+        return command
+    if not game:
+        return None
+    command['game'] = game
+    return command

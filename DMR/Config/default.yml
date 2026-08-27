@@ -32,6 +32,8 @@ ai_rename_args:
   # 也支持简写：tg: '123456:ABCDEF'；此时会从机器人最近更新自动发现 chat_id
   tg:
     enabled: false
+    # 允许回复截图发送 `P3 [03:00,05:00]`，剪除区间后更换该 BV 的指定分P
+    clip_enabled: false
     # BotFather 提供的机器人 Token；也可以使用字段名 token
     bot_token: ~
     # 私聊、群组或频道 ID；群组/频道通常是以 -100 开头的数字

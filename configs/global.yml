@@ -49,6 +49,8 @@ ai_rename_args:
   # 由各 DMR-*.yml 任务配置覆盖。chat_id 留空时可从机器人最近收到的消息中自动发现。
   tg:
     enabled: false
+    # 任务启用 Telegram 后，允许通过 P号 + 剪除区间更换指定分P
+    clip_enabled: true
     bot_token: ~
     chat_id: ~
     message_thread_id: ~

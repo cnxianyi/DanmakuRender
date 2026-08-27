@@ -17,6 +17,8 @@ ai_rename_args:
   # 直播结束后把所有分段的首帧截图合并发送到 Telegram
   tg:
       enabled: false
+      # 回复截图发送 P3 [03:00,05:00]，剪除区间并更换该 BV 的 P3
+      clip_enabled: false
       bot_token: ~
       chat_id: ~
       # 可选本地代理：http://127.0.0.1:7890 或 socks5h://127.0.0.1:1080

@@ -17,6 +17,7 @@ ai_rename_args:
   # 视频下载任务不会在直播结束时生成截图；TG 设置仅用于兼容标题人工覆盖配置
   tg:
       enabled: false
+      clip_enabled: false
       bot_token: ~
       chat_id: ~
       # 可选本地代理：http://127.0.0.1:7890 或 socks5h://127.0.0.1:1080

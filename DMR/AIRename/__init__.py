@@ -14,6 +14,7 @@ from .telegram import (
     get_updates,
     parse_update_reply,
     send_frame_album,
+    send_text_message,
     telegram_config,
     telegram_enabled,
 )
@@ -54,6 +55,8 @@ class AIRename():
             try:
                 if message.target == 'ai_rename' and message.event == 'newtask':
                     self.add_task(message)
+                elif message.target == 'ai_rename' and message.event == 'telegram_message':
+                    self._executors.submit(self._send_telegram_message, message.data or {})
             except Exception as e:
                 self.logger.error(
                     f'Game name message {message.event} ({message.request_id}) raised an error.'
@@ -141,10 +144,12 @@ class AIRename():
             for video in videos
         )
         game_line = f'当前固定游戏名：{fixed_game}\n' if fixed_game else '当前固定游戏名：未设置\n'
-        update_hint = (
-            '回复本相册中的任意图片并直接发送游戏名'
-            if args.get('update_bv_title') else ''
-        )
+        hints = []
+        if args.get('update_bv_title'):
+            hints.append('回复本相册中的任意图片并直接发送游戏名')
+        if tg_config.get('clip_enabled'):
+            hints.append('剪辑并更换分P：回复图片发送 P3 [03:00,05:00]')
+        update_hint = '\n'.join(hints)
         values = {
             'TASKNAME': videos[0].taskname or task['source'].split('/', 1)[-1],
             'COUNT': len(videos),
@@ -192,10 +197,12 @@ class AIRename():
             self.logger.warning(f'直播组 {task["group_id"]} 的 Telegram 截图发送失败: {error}')
 
     def _register_telegram_album(self, task, album):
-        if not album or not album.get('message_ids') or not task['args'].get('update_bv_title'):
+        tg_config = telegram_config(task['args'])
+        if not album or not album.get('message_ids') or not (
+            task['args'].get('update_bv_title') or tg_config.get('clip_enabled')
+        ):
             return
         args = task['args']
-        tg_config = telegram_config(args)
         token = str(tg_config.get('bot_token') or tg_config.get('token') or '').strip()
         api_base = str(tg_config.get('api_base') or 'https://api.telegram.org').rstrip('/')
         monitor_key = (token, api_base)
@@ -210,6 +217,7 @@ class AIRename():
                 'max_game_name_length': args.get('max_game_name_length', 10),
                 'excluded_names': args.get('excluded_names', []),
             },
+            'clip_enabled': bool(tg_config.get('clip_enabled')),
             'expires_at': time.time() + reply_window,
         }
         with self._lock:
@@ -248,6 +256,45 @@ class AIRename():
                         target = self._telegram_targets.get(target_key)
                     if not target or target['expires_at'] < time.time():
                         continue
+                    if command.get('clip_error'):
+                        self._queue_telegram_text(
+                            args,
+                            f'剪辑命令格式错误：{command["clip_error"]}',
+                            command['chat_id'],
+                            command.get('message_id'),
+                        )
+                        continue
+                    if command.get('clip'):
+                        if not target.get('clip_enabled'):
+                            self._queue_telegram_text(
+                                args,
+                                '当前任务未启用 Telegram 分P剪辑。',
+                                command['chat_id'],
+                                command.get('message_id'),
+                            )
+                            continue
+                        clip = command['clip']
+                        self._pipeSend(
+                            event='telegram_clip',
+                            msg=f'Telegram 请求剪辑并更换 P{clip["part_number"]}',
+                            target=target['source'],
+                            request_id=target['request_id'],
+                            data={
+                                'group_id': target['group_id'],
+                                'part_number': clip['part_number'],
+                                'remove_ranges': clip['remove_ranges'],
+                                'chat_id': command['chat_id'],
+                                'reply_message_id': command['reply_message_id'],
+                                'command_message_id': command.get('message_id'),
+                            },
+                        )
+                        self._queue_telegram_text(
+                            args,
+                            f'已接收 P{clip["part_number"]} 剪除请求，正在核对分P和本地视频。',
+                            command['chat_id'],
+                            command.get('message_id'),
+                        )
+                        continue
                     game = normalize_game(command['game'], target['game_config'])
                     if not game:
                         self.logger.warning('Telegram 回复的游戏名为空、过长或已被过滤，已忽略.')
@@ -262,6 +309,7 @@ class AIRename():
                             'game': game,
                             'chat_id': command['chat_id'],
                             'reply_message_id': command['reply_message_id'],
+                            'command_message_id': command.get('message_id'),
                         },
                     )
                 self._prune_telegram_targets(monitor_key)
@@ -270,6 +318,31 @@ class AIRename():
                 safe_error = str(error).replace(token, '***') if token else str(error)
                 self.logger.warning(f'Telegram 回复轮询失败，{retry_interval:g} 秒后重试: {safe_error}')
                 time.sleep(retry_interval)
+
+    def _queue_telegram_text(self, args, text, chat_id, reply_to_message_id=None):
+        self._executors.submit(
+            self._send_telegram_message,
+            {
+                'args': args,
+                'text': text,
+                'chat_id': chat_id,
+                'reply_to_message_id': reply_to_message_id,
+            },
+        )
+
+    def _send_telegram_message(self, data):
+        try:
+            send_text_message(
+                data.get('args') or {},
+                data.get('text') or '',
+                chat_id=data.get('chat_id'),
+                reply_to_message_id=data.get('reply_to_message_id'),
+            )
+        except Exception as error:
+            tg_config = telegram_config(data.get('args') or {})
+            token = str(tg_config.get('bot_token') or tg_config.get('token') or '').strip()
+            safe_error = str(error).replace(token, '***') if token else str(error)
+            self.logger.warning(f'Telegram 状态消息发送失败: {safe_error}')
 
     def _prune_telegram_targets(self, monitor_key):
         now = time.time()

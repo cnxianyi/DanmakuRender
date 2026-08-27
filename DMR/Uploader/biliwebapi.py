@@ -319,6 +319,34 @@ class BiliWebApi:
         submit_api: Callable[[str], None] = None,
     ):
 
+        status, video_part = self.upload_part(
+            stream_queue=stream_queue,
+            file_name=file_name,
+            total_size=total_size,
+            lines=lines,
+        )
+        if not status:
+            return False, video_part
+
+        if new_videos := self.get_remote_data(videos.bvid):
+            videos = new_videos
+        videos.append(video_part)  # 添加已经上传的视频
+
+        ret = self.submit(submit_api=submit_api, videos=videos)
+        logger.info(f"上传成功: {ret}")
+        bvid = ret['data']['bvid']
+        videos.bvid = bvid
+        return True, bvid
+
+    def upload_part(
+        self,
+        stream_queue: queue.SimpleQueue,
+        file_name,
+        total_size,
+        lines='AUTO',
+    ):
+        """Upload one media resource without adding it to an archive."""
+
         logger.info(f"{file_name} 开始上传")
         cs_upcdn = ['alia', 'bda', 'bda2', 'bldsa', 'qn', 'tx', 'txa']
         jd_upcdn = ['jd-alia', 'jd-bd', 'jd-bldsa', 'jd-tx', 'jd-txa']
@@ -374,16 +402,104 @@ class BiliWebApi:
             # stop_event.set()
             return False, '分P上传失败'
         video_part['title'] = video_part['title'][:80]
+        return True, video_part
 
-        if new_videos := self.get_remote_data(videos.bvid):
-            videos = new_videos
-        videos.append(video_part)  # 添加已经上传的视频
+    def replace_video_part(
+        self,
+        bvid,
+        part_number,
+        filepath,
+        lines='AUTO',
+        expected_cid=None,
+        expected_title=None,
+        verify_retries=3,
+        verify_interval=2,
+    ):
+        """Upload ``filepath`` and replace exactly one existing archive part."""
+        part_number = int(part_number)
+        if part_number < 1:
+            raise ValueError('P号必须从 P1 开始')
 
-        ret = self.submit(submit_api=submit_api, videos=videos)
-        logger.info(f"上传成功: {ret}")
-        bvid = ret['data']['bvid']
-        videos.bvid = bvid
-        return True, bvid
+        before = self.get_remote_data(bvid)
+        if before is None:
+            raise RuntimeError(f'无法读取 B 站稿件 {bvid} 的编辑信息')
+        if part_number > len(before.videos):
+            raise ValueError(
+                f'{bvid} 只有 {len(before.videos)} 个分P，找不到 P{part_number}'
+            )
+        before_part = before.videos[part_number - 1]
+        if expected_cid is not None and str(before_part.get('cid')) != str(expected_cid):
+            raise RuntimeError(
+                f'{bvid} P{part_number} 的 CID 已变化，已拒绝更换以避免误操作'
+            )
+        if expected_title is not None and before_part.get('title') != expected_title:
+            raise RuntimeError(
+                f'{bvid} P{part_number} 的标题已变化，已拒绝更换以避免误操作'
+            )
+
+        status, video_part = self.upload_part(
+            stream_queue=filepath,
+            file_name=os.path.basename(filepath),
+            total_size=os.path.getsize(filepath),
+            lines=lines,
+        )
+        if not status:
+            raise RuntimeError(str(video_part))
+
+        # Uploading can take a long time. Refresh the archive and ensure P number
+        # still points at the same CID/title before issuing the destructive edit.
+        latest = self.get_remote_data(bvid)
+        if latest is None:
+            raise RuntimeError(f'上传完成后无法重新读取 B 站稿件 {bvid}')
+        if len(latest.videos) != len(before.videos):
+            raise RuntimeError(f'{bvid} 的分P数量在上传期间发生变化，已拒绝更换')
+        latest_part = latest.videos[part_number - 1]
+        if (
+            str(latest_part.get('cid')) != str(before_part.get('cid'))
+            or latest_part.get('title') != before_part.get('title')
+        ):
+            raise RuntimeError(
+                f'{bvid} P{part_number} 在上传期间发生变化，已拒绝更换以避免误操作'
+            )
+
+        video_part['title'] = latest_part['title']
+        video_part['desc'] = latest_part.get('desc', '')
+        latest.videos[part_number - 1] = video_part
+
+        # Sorting would change the meaning of P<number>; preserve the remote order
+        # for this operation even if normal append uploads have sorting enabled.
+        sort_videos = self.sort_videos
+        self.sort_videos = False
+        try:
+            response = self.submit(submit_api='web', videos=latest)
+        finally:
+            self.sort_videos = sort_videos
+
+        new_filename = video_part.get('filename')
+        verified = False
+        verified_part = None
+        for attempt in range(max(0, int(verify_retries)) + 1):
+            remote = self.get_remote_data(bvid)
+            if remote is not None and len(remote.videos) >= part_number:
+                verified_part = remote.videos[part_number - 1]
+                if (
+                    verified_part.get('filename') == new_filename
+                    and verified_part.get('title') == latest_part.get('title')
+                ):
+                    verified = True
+                    break
+            if attempt < int(verify_retries) and verify_interval:
+                time.sleep(max(0, float(verify_interval)))
+
+        return {
+            'bvid': bvid,
+            'part_number': part_number,
+            'old_part': before_part,
+            'new_part': video_part,
+            'verified_part': verified_part,
+            'verified': verified,
+            'response': response,
+        }
 
     async def upos_stream(self, stream_queue, file_name, total_size, ret):
         # print("--------------, ", file_name)
@@ -646,7 +762,7 @@ class BiliWebApi:
                         'title': video['title'],
                         'filename': video['filename'],
                         'cid': video['cid'],
-                        'desc': '',
+                        'desc': video.get('desc', ''),
                     })
                 return video_data
         except Exception as e:
